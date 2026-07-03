@@ -31,6 +31,7 @@ import base64
 import datetime
 import itertools
 import os
+import re
 import socket
 import socketserver
 import ssl
@@ -346,6 +347,29 @@ class Color:
 
     @staticmethod
     def d(s): return Color._w(s, "0;90")
+
+
+# ---- persistent full console log ------------------------------------------
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _Tee:
+    """Mirror everything printed to the console into a file (ANSI stripped),
+    so the full connection/handshake trace is persisted, not just captures."""
+
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, s):
+        self._stream.write(s)
+        self._fh.write(_ANSI.sub("", s))
+        return len(s)
+
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
 
 
 # ---- loud connection logging (shared by both servers) ----------------------
@@ -673,6 +697,17 @@ def main():
 
     sink = Sink(args.outdir, hexu(challenge8).lower())
 
+    # Persist the entire console trace (connections, handshake steps, captures,
+    # errors) to loot/session.log — no need to remember to `tee`.
+    session_log = os.path.join(args.outdir, "session.log")
+    try:
+        _sfh = open(session_log, "a", buffering=1)
+        _sfh.write("\n===== ntlm_catch session %s =====\n"
+                   % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        sys.stdout = _Tee(sys.stdout, _sfh)
+    except Exception:
+        pass
+
     servers = []
     threads = []
 
@@ -688,7 +723,8 @@ def main():
     print("  downgrade   : %s" % ("ON — coaxing NetNTLMv1 (ESS cleared)"
                                   if args.downgrade else "off (ESS kept)"))
     print("  advertising : %s\\%s" % (args.domain, args.computer))
-    print("  loot dir    : %s/" % args.outdir)
+    print("  loot dir    : %s/  (netntlmv1.txt, netntlmv2.txt, capture.log, "
+          "session.log)" % args.outdir)
 
     if args.mode in ("both", "smb"):
         try:

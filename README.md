@@ -96,7 +96,9 @@ Key flags (`--help` for all):
 loot/
 ├── netntlmv1.txt   # hashcat -m 5500 lines (deduped)
 ├── netntlmv2.txt   # hashcat -m 5600 lines (deduped)
-└── capture.log     # every capture, timestamped, source (SMB/HTTP) + client IP
+├── capture.log     # every capture, timestamped, source (SMB/HTTP) + client IP
+└── session.log     # the FULL console trace: connections, handshake steps,
+                    #   captures, errors — persisted so you don't need `tee`
 ```
 
 Crack:
