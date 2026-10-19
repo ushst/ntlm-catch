@@ -89,6 +89,9 @@ Key flags (`--help` for all):
 | `--tls` (+ `--cert/--key`) | off | HTTP listener serves HTTPS |
 | `-o/--outdir` | `loot` | where hashes + log go |
 | `-v/--verbose` | off | per-message SMB/HTTP handshake steps |
+| `--socket-timeout` | `15` | report and close incomplete client connections |
+| `--no-wire-monitor` | off | disable raw TCP diagnostics for SMB/445 |
+| `--wire-interface` | all | restrict raw SMB diagnostics to one interface, e.g. `eth0` |
 
 ## Output
 

