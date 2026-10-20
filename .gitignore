@@ -1,3 +1,7 @@
 loot/
 __pycache__/
 *.pyc
+PUBLIC/
+LAB.md
+# Captures contain hashes, account names, IP addresses, and session details.
+lab/
