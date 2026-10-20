@@ -26,12 +26,15 @@ works over SMB and HTTP alike.
 Pure Python 3.7+ stdlib. Authorized testing only.
 """
 import argparse
+import atexit
 import binascii
 import base64
+import collections
 import datetime
 import itertools
 import os
 import re
+import shutil
 import socket
 import socketserver
 import ssl
@@ -40,6 +43,7 @@ import sys
 import threading
 import time
 import traceback
+import textwrap
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---- NTLM constants --------------------------------------------------------
@@ -288,6 +292,35 @@ class Sink:
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _filename_part(value, fallback):
+        value = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "").strip("._-")
+        return value[:64] or fallback
+
+    def _write_capture_file(self, captured_at, client_ip, t, source, kind,
+                            hashline):
+        """Write one hash per file; O_EXCL also makes concurrent names safe."""
+        parts = (
+            captured_at.strftime("%Y%m%dT%H%M%S.%f"),
+            self._filename_part(source.lower(), "unknown"),
+            self._filename_part(client_ip, "unknown-ip"),
+            self._filename_part(t.domain, "no-domain"),
+            self._filename_part(t.user, "no-user"),
+            self._filename_part(kind.lower(), "ntlm"),
+        )
+        stem = "_".join(parts)
+        for suffix in range(1000):
+            name = stem + ("_%d" % suffix if suffix else "") + ".txt"
+            path = os.path.join(self.outdir, name)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "w") as fh:
+                fh.write(hashline + "\n")
+            return path
+        raise OSError("could not allocate a unique capture filename")
+
     def handle(self, client_ip, t, source):
         # Null / anonymous session: no NT response and no user -> nothing to
         # crack. Note it but don't pollute the loot files.
@@ -296,7 +329,8 @@ class Sink:
                           % (source, client_ip)))
             return
 
-        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        captured_at = datetime.datetime.now()
+        stamp = captured_at.strftime("%Y-%m-%d %H:%M:%S")
         if t.is_v1:
             kind = "NetNTLMv1-SSP(ESS)" if t.is_v1_ess else "NetNTLMv1"
             hashline = format_v1(t, self.challenge_hex)
@@ -338,10 +372,13 @@ class Sink:
         with self.lock:
             with open(self.log_file, "a") as fh:
                 fh.write(rec + "\n")
+            capture_file = self._write_capture_file(
+                captured_at, client_ip, t, source, kind, hashline)
             if not dup:
                 target = self.v1_file if t.is_v1 else self.v2_file
                 with open(target, "a") as fh:
                     fh.write(hashline + "\n")
+        print(C.d("    saved       : %s" % capture_file))
 
 
 # ---- color -----------------------------------------------------------------
@@ -387,6 +424,92 @@ class _Tee:
     def flush(self):
         self._stream.flush()
         self._fh.flush()
+
+
+class _SplitView:
+    """TTY dashboard: useful protocol events left, complete raw log right."""
+
+    _INFO_MARKERS = (
+        "TCP from", "attempt stage:", "SESSION_SETUP", "[http]", "NTLM ",
+        "challenge", "downgrade", "captured", "account", "workstation",
+        "client stayed", "saved", "anonymous", "listening", "[!]", "[+]",
+        "stopping", "stopped",
+    )
+
+    def __init__(self, stream, log_fh):
+        self._stream = stream
+        self._log_fh = log_fh
+        self._raw = collections.deque(maxlen=1000)
+        self._info = collections.deque(maxlen=500)
+        self._partial = ""
+        self._lock = threading.RLock()
+        self._closed = False
+        self._stream.write("\033[?1049h\033[?25l")
+        self._render()
+
+    @staticmethod
+    def available(stream):
+        size = shutil.get_terminal_size((120, 30))
+        return stream.isatty() and size.columns >= 100 and size.lines >= 16
+
+    def write(self, data):
+        if not data:
+            return 0
+        plain = _ANSI.sub("", data)
+        with self._lock:
+            self._log_fh.write(plain)
+            self._partial += plain
+            while "\n" in self._partial:
+                line, self._partial = self._partial.split("\n", 1)
+                self._raw.append(line)
+                if line.strip() and any(marker in line
+                                        for marker in self._INFO_MARKERS):
+                    now = datetime.datetime.now().strftime("%H:%M:%S")
+                    self._info.append("%s  %s" % (now, line.strip()))
+            self._render()
+        return len(data)
+
+    def flush(self):
+        with self._lock:
+            self._log_fh.flush()
+
+    @staticmethod
+    def _visible(lines, width, height):
+        wrapped = []
+        for line in lines:
+            wrapped.extend(textwrap.wrap(line, width=width,
+                                         replace_whitespace=False,
+                                         drop_whitespace=False) or [""])
+        return wrapped[-height:]
+
+    def _render(self):
+        if self._closed:
+            return
+        size = shutil.get_terminal_size((120, 30))
+        width, height = size.columns, size.lines
+        left_width = max(38, width * 45 // 100)
+        right_width = width - left_width - 3
+        body_height = max(1, height - 3)
+        left = self._visible(self._info, left_width, body_height)
+        right = self._visible(self._raw, right_width, body_height)
+        rows = [" EVENTS".ljust(left_width) + " | RAW LOG"]
+        rows.append(("=" * left_width) + "=+=" + ("=" * right_width))
+        for i in range(body_height):
+            lval = left[i] if i < len(left) else ""
+            rval = right[i] if i < len(right) else ""
+            rows.append(lval[:left_width].ljust(left_width) + " | " +
+                        rval[:right_width])
+        self._stream.write("\033[H" + "\n".join(rows))
+        self._stream.flush()
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._log_fh.flush()
+            self._stream.write("\033[?25h\033[?1049l")
+            self._stream.flush()
 
 
 # ---- loud connection logging (shared by both servers) ----------------------
@@ -894,7 +1017,8 @@ def main():
                         "(default 1122334455667788 — crack.sh table)")
     dg = p.add_mutually_exclusive_group()
     dg.add_argument("--downgrade", dest="downgrade", action="store_true",
-                    default=True, help="clear ESS to force NetNTLMv1 (default)")
+                    default=True, help="clear ESS to request NetNTLMv1 where "
+                                       "client policy allows it (default)")
     dg.add_argument("--no-downgrade", dest="downgrade", action="store_false",
                     help="leave ESS on; capture whatever the client sends")
     p.add_argument("--domain", default="CORP",
@@ -918,6 +1042,8 @@ def main():
                    help="capture SMB TCP diagnostics only on this interface "
                         "(for example eth0)")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    p.add_argument("--no-split-view", action="store_true",
+                   help="disable the interactive events/raw-log split view")
     args = p.parse_args()
     if args.socket_timeout <= 0:
         p.error("--socket-timeout must be > 0")
@@ -944,11 +1070,18 @@ def main():
     # Persist the entire console trace (connections, handshake steps, captures,
     # errors) to loot/session.log — no need to remember to `tee`.
     session_log = os.path.join(args.outdir, "session.log")
+    split_view = None
     try:
         _sfh = open(session_log, "a", buffering=1)
         _sfh.write("\n===== ntlm_catch session %s =====\n"
                    % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        sys.stdout = _Tee(sys.stdout, _sfh)
+        original_stdout = sys.stdout
+        if not args.no_split_view and _SplitView.available(original_stdout):
+            split_view = _SplitView(original_stdout, _sfh)
+            sys.stdout = split_view
+            atexit.register(split_view.close)
+        else:
+            sys.stdout = _Tee(original_stdout, _sfh)
     except Exception:
         pass
 
@@ -968,8 +1101,8 @@ def main():
     print("  downgrade   : %s" % ("ON — coaxing NetNTLMv1 (ESS cleared)"
                                   if args.downgrade else "off (ESS kept)"))
     print("  advertising : %s\\%s" % (args.domain, args.computer))
-    print("  loot dir    : %s/  (netntlmv1.txt, netntlmv2.txt, capture.log, "
-          "session.log)" % args.outdir)
+    print("  loot dir    : %s/  (one file per capture + aggregate hash files, "
+          "capture.log, session.log)" % args.outdir)
 
     if args.mode in ("both", "smb"):
         try:
@@ -1018,6 +1151,8 @@ def main():
 
     if not servers:
         print(Color.y("[!] no listeners started — nothing to do."))
+        if split_view:
+            split_view.close()
         return
 
     print(Color.d("  no poisoning / no relay — point coerced auth here "
@@ -1032,6 +1167,8 @@ def main():
         for s in servers:
             s.shutdown()
         print("[*] stopped. loot in %s/" % args.outdir)
+        if split_view:
+            split_view.close()
 
 
 if __name__ == "__main__":
