@@ -7,11 +7,13 @@ and/or HTTP (80) endpoints that answer with an NTLM challenge, hand out a
 NetNTLMv1, then parse and log the Type-3 response in full and emit hashcat-ready
 lines.
 
-It is a LISTENER, built for coercion:
+It is a LISTENER with an optional, explicitly scoped lab poisoner:
 
-  * No poisoning (no LLMNR / NBT-NS / mDNS). You point coerced auth at it
-    yourself: PetitPotam / PrinterBug / DFSCoerce -> SMB(445); WebDAV / Exchange
-    / @80 tricks -> HTTP(80).
+  * Poisoning is disabled by default. You can point coerced auth at it yourself:
+    PetitPotam / PrinterBug / DFSCoerce -> SMB(445); WebDAV / Exchange / @80
+    tricks -> HTTP(80).
+  * Optional LLMNR / NBT-NS / mDNS responses require an explicit listener IP
+    and source CIDR. Analyze mode observes without answering.
   * No relay, no payloads. It only records what authenticates to it.
   * Never silent. It prints a line the instant a TCP connection is accepted,
     before any protocol parsing — so if tcpdump shows packets, you see them
@@ -53,6 +55,7 @@ except ImportError:
     termios = None
     tty = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from name_poisoner import NamePoisoner
 
 # ---- NTLM constants --------------------------------------------------------
 
@@ -593,6 +596,10 @@ def _format_event(line):
     ts = f"\x1b[90m{now}\x1b[0m"
     pad = "          "
 
+    if plain.startswith("[poison]"):
+        return (f"{ts} \x1b[1;31m[POISON]\x1b[0m " +
+                f"\x1b[0;36m{plain[len('[poison]'):].strip()}\x1b[0m")
+
     # Capture header
     m = re.search(r"\[\+\]\s+\[(\w+)\]\s+NTLM\s+(\S+)\s+captured\s+<-\s+([0-9.]+)", plain)
     if m:
@@ -829,6 +836,9 @@ class _SplitView:
                 elif ch in ("d",): actions.append("half_page_down")
                 elif ch in ("f", " "): actions.append("page_down")
                 elif ch in ("b",): actions.append("page_up")
+                elif ch == "1": actions.append("toggle_llmnr")
+                elif ch == "2": actions.append("toggle_nbns")
+                elif ch == "3": actions.append("toggle_mdns")
                 elif ch == "\x03": actions.append("interrupt")
                 i += 1
         return actions, buf[i:]
@@ -877,6 +887,10 @@ class _SplitView:
                 self._active_pane = "right"
             else:
                 self._active_pane = "left" if self._active_pane == "right" else "right"
+        elif isinstance(act, str) and act.startswith("toggle_"):
+            poisoner = self._stats.get("poisoner")
+            if poisoner is not None:
+                poisoner.toggle(act.split("_", 1)[1])
         elif isinstance(act, tuple) and act[0] == "mouse":
             btn, x = act[1], act[2]
             left_w = max(34, int(size.columns * 0.46))
@@ -981,6 +995,12 @@ class _SplitView:
         if self._stats.get("http_port"):
             ports.append(f"\033[1;35mHTTP:{self._stats['http_port']}\033[0m")
         ports_str = " ".join(ports)
+        poisoner = self._stats.get("poisoner")
+        poison_str = ""
+        if poisoner is not None:
+            mode = "A" if poisoner.analyze else "P"
+            poison_str = (f"\033[1;31m{mode}:{poisoner.status()}\033[0m "
+                          f"\033[90mq:{poisoner.queries}/a:{poisoner.answers}\033[0m")
 
         dg_on = self._stats.get("downgrade", True)
         dg_str = "\033[1;32mDG:ON\033[0m" if dg_on else "\033[1;33mDG:OFF\033[0m"
@@ -1002,6 +1022,7 @@ class _SplitView:
                 title,
                 pulse_str,
                 ports_str,
+                poison_str,
                 dg_str,
                 f"Captures: \033[1;32m{tot}\033[0m (\033[1;36mv1:{v1}\033[0m, \033[1;33mv2:{v2}\033[0m)",
                 f"\033[90mConns:{conns}\033[0m",
@@ -1012,6 +1033,7 @@ class _SplitView:
                 title,
                 pulse_str,
                 ports_str,
+                poison_str,
                 f"Cap: \033[1;32m{tot}\033[0m (\033[1;36mv1:{v1}\033[0m,\033[1;33mv2:{v2}\033[0m)",
                 up_str,
             ]
@@ -1019,10 +1041,11 @@ class _SplitView:
             items = [
                 title,
                 pulse_str,
+                poison_str,
                 f"Cap:\033[1;32m{tot}\033[0m",
                 up_str,
             ]
-        return ansi_fit(sep.join(items), width)
+        return ansi_fit(sep.join(item for item in items if item), width)
 
     def _build_footer_bar(self, width):
         outdir = self._stats.get("outdir", "loot")
@@ -1033,6 +1056,7 @@ class _SplitView:
         if width >= 115:
             items = [
                 "\033[1;37mTab: Pane\033[0m",
+                "\033[1;31m1:L 2:N 3:M\033[0m",
                 nav_hint,
                 "\033[90mPgUp/Dn\033[0m",
                 f"\033[90mLoot:\033[0m \033[0;32m{outdir}/\033[0m",
@@ -1042,6 +1066,7 @@ class _SplitView:
         elif width >= 90:
             items = [
                 "\033[1;37mTab: Pane\033[0m",
+                "\033[1;31m1/2/3: Poison\033[0m",
                 nav_hint,
                 f"\033[90mLoot:\033[0m \033[0;32m{outdir}/\033[0m",
                 "\033[1;37mq: Stop\033[0m",
@@ -1676,11 +1701,37 @@ def main():
     p.add_argument("--no-color", action="store_true", help="disable ANSI color")
     p.add_argument("--no-split-view", action="store_true",
                    help="disable the interactive events/raw-log split view")
+    poison_mode = p.add_mutually_exclusive_group()
+    poison_mode.add_argument("--poison", action="store_true",
+                             help="actively answer scoped LLMNR/NBT-NS/mDNS queries")
+    poison_mode.add_argument("--poison-analyze", action="store_true",
+                             help="observe scoped name queries without answering")
+    p.add_argument("--poison-ip",
+                   help="IPv4 address advertised by the poisoner and used to join multicast groups")
+    p.add_argument("--poison-cidr",
+                   help="required source scope, for example 192.168.56.0/24")
+    p.add_argument("--poison-protocols", default="llmnr,nbns,mdns",
+                   help="comma-separated subset of llmnr,nbns,mdns")
+    p.add_argument("--poison-allow", action="append", default=[],
+                   help="only answer this hostname or DNS suffix (repeatable)")
     args = p.parse_args()
     if args.socket_timeout <= 0:
         p.error("--socket-timeout must be > 0")
     if bool(args.cert) != bool(args.key):
         p.error("--cert and --key must be provided together")
+    poisoning = args.poison or args.poison_analyze
+    if poisoning and (not args.poison_ip or not args.poison_cidr):
+        p.error("--poison/--poison-analyze require --poison-ip and --poison-cidr")
+    poison_protocols = {
+        item.strip().lower() for item in args.poison_protocols.split(",")
+        if item.strip()
+    }
+    unknown_protocols = poison_protocols - {"llmnr", "nbns", "mdns"}
+    if unknown_protocols:
+        p.error("unknown poison protocol(s): %s" %
+                ", ".join(sorted(unknown_protocols)))
+    if poisoning and not poison_protocols:
+        p.error("--poison-protocols must enable at least one protocol")
 
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -1741,6 +1792,7 @@ def main():
     servers = []
     threads = []
     wire_monitor = None
+    poisoner = None
 
     def start(server, label):
         th = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1749,7 +1801,7 @@ def main():
         threads.append(th)
         print("  [+] %s" % label)
 
-    print(Color.b("ntlm_catch — NetNTLM capture (listener only, no poisoning)"))
+    print(Color.b("ntlm_catch — NetNTLM capture listener"))
     print("  challenge   : %s  (fixed)" % hexu(challenge8))
     print("  downgrade   : %s" % ("ON — coaxing NetNTLMv1 (ESS cleared)"
                                   if args.downgrade else "off (ESS kept)"))
@@ -1809,6 +1861,18 @@ def main():
                 http.server_close()
             print(Color.y("  [!] HTTP startup failed: %s" % e))
 
+    if servers and poisoning:
+        try:
+            poisoner = NamePoisoner(
+                args.poison_ip, args.poison_cidr, poison_protocols,
+                analyze=args.poison_analyze, allow_names=args.poison_allow)
+            stats["poisoner"] = poisoner
+            if not poisoner.start():
+                poisoner = None
+                stats.pop("poisoner", None)
+        except (ValueError, OSError) as e:
+            print(Color.y("  [!] name poisoner startup failed: %s" % e))
+
     if not servers:
         if split_view:
             split_view.close()
@@ -1821,8 +1885,13 @@ def main():
             session_fh.close()
         return
 
-    print(Color.d("  no poisoning / no relay — point coerced auth here "
-                  "yourself.  Ctrl-C to stop.\n"))
+    if poisoner:
+        print(Color.y("  poisoning scope: %s; TUI 1=LLMNR 2=NBT-NS 3=mDNS"
+                      % args.poison_cidr))
+    else:
+        print(Color.d("  no poisoning / no relay — point coerced auth here "
+                      "yourself."))
+    print(Color.d("  Ctrl-C to stop.\n"))
 
     stop_event = threading.Event()
     old_handlers = {}
@@ -1853,6 +1922,8 @@ def main():
         print("\n" + Color.b("[*] Stopping listeners..."))
         if wire_monitor:
             wire_monitor.close()
+        if poisoner:
+            poisoner.close()
         for s in servers:
             s.shutdown()
             s.server_close()
@@ -1861,6 +1932,9 @@ def main():
         print("    Captures      : %d total (%d NetNTLMv1, %d NetNTLMv2)"
               % (stats["captures_total"], stats["captures_v1"], stats["captures_v2"]))
         print("    Connections   : %d accepted" % stats["connections"])
+        if poisoner:
+            print("    Name queries  : %d observed, %d answered" %
+                  (poisoner.queries, poisoner.answers))
         sys.stdout.flush()
         sys.stdout = original_stdout
         if session_fh:

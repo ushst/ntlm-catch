@@ -31,6 +31,30 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(actions, ["up"])
         self.assertEqual(rest, "")
 
+    def test_poisoner_hotkeys(self):
+        view = ntlm_catch._SplitView.__new__(ntlm_catch._SplitView)
+        actions, rest = view._parse_input("123")
+        self.assertEqual(actions, ["toggle_llmnr", "toggle_nbns",
+                                   "toggle_mdns"])
+        self.assertEqual(rest, "")
+
+    def test_poisoner_hotkey_calls_runtime_toggle(self):
+        class FakePoisoner:
+            def __init__(self):
+                self.toggled = []
+
+            def toggle(self, protocol):
+                self.toggled.append(protocol)
+
+        poisoner = FakePoisoner()
+        view = ntlm_catch._SplitView.__new__(ntlm_catch._SplitView)
+        view._stats = {"poisoner": poisoner}
+        view._active_pane = "right"
+        view._scroll_left = 0
+        view._scroll_right = 0
+        view._handle_action("toggle_nbns")
+        self.assertEqual(poisoner.toggled, ["nbns"])
+
 
 class ProtocolTests(unittest.TestCase):
     def test_type2_challenge_and_downgrade_flag(self):

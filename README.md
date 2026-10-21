@@ -6,9 +6,9 @@ NTLM challenge, hand out a **fixed server challenge**, try to **downgrade the
 client to NetNTLMv1**, then parse and log the Type-3 response in full and write
 hashcat-ready lines.
 
-It is **listener-only** by design — built to sit at the end of a coercion:
+By default it is **listener-only** — built to sit at the end of a coercion:
 
-- **No poisoning** — no LLMNR / NBT-NS / mDNS. You point coerced auth at it:
+- **No poisoning by default.** You can point coerced auth at it directly:
   - **SMB / 445** ← PetitPotam, PrinterBug (MS-RPRN), DFSCoerce, `\\attacker\x` UNC
   - **HTTP / 80** ← WebDAV coercion, Exchange PushSubscription, `@80` tricks
 - **No relay, no payloads** — it only records what authenticates to it.
@@ -75,6 +75,45 @@ python3 ntlm_catch.py --mode http --http-port 8080
 sudo python3 ntlm_catch.py --no-downgrade --challenge 0011223344556677
 ```
 
+Optional scoped name-resolution mode for an isolated authorized lab:
+
+```bash
+# Observe queries without answering first
+sudo python3 ntlm_catch.py --poison-analyze \
+  --poison-ip 192.168.56.10 --poison-cidr 192.168.56.0/24
+
+# Actively answer LLMNR, NBT-NS and mDNS only inside that subnet
+sudo python3 ntlm_catch.py --poison \
+  --poison-ip 192.168.56.10 --poison-cidr 192.168.56.0/24 \
+  --poison-allow lab.local
+```
+
+Active poisoning is never enabled implicitly. `--poison-cidr` is mandatory,
+the listener ignores its own address, responses are rate-limited, and
+`--poison-allow` can be repeated for exact names or DNS suffixes. In the TUI,
+keys `1`, `2`, and `3` toggle LLMNR, NBT-NS, and mDNS at runtime. Lowercase
+letters in `P:LNM` indicate a disabled protocol. `A:LNM` denotes analyze mode.
+
+### Why a domain controller may authenticate without explicit coercion
+
+A DC or another server can initiate outbound SMB/HTTP authentication during
+ordinary administration. Common causes in a lab or legacy environment include:
+
+- a stale or misspelled UNC path in a GPO, logon/startup script or software
+  deployment;
+- a scheduled task or Windows service running as `SYSTEM` that accesses a
+  network path;
+- an obsolete DFS namespace, backup, monitoring, print or deployment target;
+- AV/EDR or indexing software inspecting a referenced remote file;
+- an administrator opening a UNC path interactively on the server.
+
+If normal DNS resolution fails, Windows may fall back to LLMNR or NBT-NS. A
+reply can then cause authentication as `DOMAIN\\DCNAME$`. This is the domain
+controller's machine account, not the interactive domain administrator. Modern
+DCs normally emit NetNTLMv2, and machine account passwords are long and rotated;
+the meaningful exposure is usually whether the authentication can be relayed
+to another service. `ntlm-catch` records responses but does not relay them.
+
 The optional lab helpers generate and serve test documents for an explicitly
 authorized environment:
 
@@ -104,6 +143,11 @@ Key flags (`--help` for all):
 | `--no-wire-monitor` | off | disable raw TCP diagnostics for SMB/445 |
 | `--wire-interface` | all | restrict raw SMB diagnostics to one interface, e.g. `eth0` |
 | `--no-split-view` | off | disable the automatic interactive split view |
+| `--poison` | off | answer scoped LLMNR/NBT-NS/mDNS queries |
+| `--poison-analyze` | off | observe matching name queries without answering |
+| `--poison-ip` / `--poison-cidr` | required for poisoner | response address and permitted source network |
+| `--poison-protocols` | all three | comma-separated protocol subset |
+| `--poison-allow NAME` | unrestricted within CIDR | exact hostname or suffix filter; repeatable |
 
 When stdout is an interactive terminal (>= 76 columns), the listener
 automatically opens a dynamic color dashboard: high-level protocol events and
