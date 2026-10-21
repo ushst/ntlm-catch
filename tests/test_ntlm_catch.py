@@ -33,9 +33,9 @@ class FormattingTests(unittest.TestCase):
 
     def test_poisoner_hotkeys(self):
         view = ntlm_catch._SplitView.__new__(ntlm_catch._SplitView)
-        actions, rest = view._parse_input("123")
+        actions, rest = view._parse_input("123r")
         self.assertEqual(actions, ["toggle_llmnr", "toggle_nbns",
-                                   "toggle_mdns"])
+                                   "toggle_mdns", "retry_listeners"])
         self.assertEqual(rest, "")
 
     def test_poisoner_hotkey_calls_runtime_toggle(self):
@@ -54,6 +54,16 @@ class FormattingTests(unittest.TestCase):
         view._scroll_right = 0
         view._handle_action("toggle_nbns")
         self.assertEqual(poisoner.toggled, ["nbns"])
+
+    def test_retry_hotkey_calls_listener_retry(self):
+        called = []
+        view = ntlm_catch._SplitView.__new__(ntlm_catch._SplitView)
+        view._stats = {"retry_listeners": lambda: called.append(True)}
+        view._active_pane = "right"
+        view._scroll_left = 0
+        view._scroll_right = 0
+        view._handle_action("retry_listeners")
+        self.assertEqual(called, [True])
 
 
 class ProtocolTests(unittest.TestCase):

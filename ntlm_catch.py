@@ -839,6 +839,7 @@ class _SplitView:
                 elif ch == "1": actions.append("toggle_llmnr")
                 elif ch == "2": actions.append("toggle_nbns")
                 elif ch == "3": actions.append("toggle_mdns")
+                elif ch in ("r", "R"): actions.append("retry_listeners")
                 elif ch == "\x03": actions.append("interrupt")
                 i += 1
         return actions, buf[i:]
@@ -891,6 +892,10 @@ class _SplitView:
             poisoner = self._stats.get("poisoner")
             if poisoner is not None:
                 poisoner.toggle(act.split("_", 1)[1])
+        elif act == "retry_listeners":
+            retry = self._stats.get("retry_listeners")
+            if retry is not None:
+                retry()
         elif isinstance(act, tuple) and act[0] == "mouse":
             btn, x = act[1], act[2]
             left_w = max(34, int(size.columns * 0.46))
@@ -986,14 +991,19 @@ class _SplitView:
 
     def _build_top_bar(self, width):
         pcol = self._PULSE_COLORS[self._tick_count % len(self._PULSE_COLORS)]
-        pulse_str = f"\033[{pcol}m●\033[0m \033[1;32mLISTENING\033[0m"
         title = "\033[1;36mNTLM-CATCH\033[0m"
 
         ports = []
-        if self._stats.get("smb_port"):
-            ports.append(f"\033[1;34mSMB:{self._stats['smb_port']}\033[0m")
-        if self._stats.get("http_port"):
-            ports.append(f"\033[1;35mHTTP:{self._stats['http_port']}\033[0m")
+        listener_status = self._stats.get("listener_status", {})
+        for kind, color in (("smb", "34"), ("http", "35")):
+            port = self._stats.get(kind + "_port")
+            if not port:
+                continue
+            up = listener_status.get(kind, {}).get("state") == "up"
+            state = "UP" if up else "DOWN"
+            state_color = "1;32" if up else "1;31"
+            ports.append(f"\033[1;{color}m{kind.upper()}:{port}\033[0m"
+                         f"\033[{state_color}m/{state}\033[0m")
         ports_str = " ".join(ports)
         poisoner = self._stats.get("poisoner")
         poison_str = ""
@@ -1017,6 +1027,12 @@ class _SplitView:
         up_str = f"\033[1;37m{h:02d}:{m:02d}:{s:02d}\033[0m"
 
         sep = " \033[90m│\033[0m "
+        any_listener_up = any(
+            value.get("state") == "up" for value in listener_status.values())
+        pulse_str = (f"\033[{pcol}m●\033[0m \033[1;32mLISTENING\033[0m"
+                     if any_listener_up else
+                     "\033[1;31m● WAITING FOR PORT\033[0m")
+
         if width >= 115:
             items = [
                 title,
@@ -1057,6 +1073,7 @@ class _SplitView:
             items = [
                 "\033[1;37mTab: Pane\033[0m",
                 "\033[1;31m1:L 2:N 3:M\033[0m",
+                "\033[1;37mr: Retry\033[0m",
                 nav_hint,
                 "\033[90mPgUp/Dn\033[0m",
                 f"\033[90mLoot:\033[0m \033[0;32m{outdir}/\033[0m",
@@ -1067,6 +1084,7 @@ class _SplitView:
             items = [
                 "\033[1;37mTab: Pane\033[0m",
                 "\033[1;31m1/2/3: Poison\033[0m",
+                "\033[1;37mr: Retry\033[0m",
                 nav_hint,
                 f"\033[90mLoot:\033[0m \033[0;32m{outdir}/\033[0m",
                 "\033[1;37mq: Stop\033[0m",
@@ -1074,6 +1092,7 @@ class _SplitView:
         else:
             items = [
                 "\033[1;37mTab: Pane\033[0m",
+                "\033[1;37mr: Retry\033[0m",
                 nav_hint,
                 "\033[1;37mq: Stop\033[0m",
             ]
@@ -1762,7 +1781,13 @@ def main():
         "mode": args.mode,
         "smb_port": args.smb_port if args.mode in ("both", "smb") else None,
         "http_port": args.http_port if args.mode in ("both", "http") else None,
+        "listener_status": {},
     }
+    for listener_kind in ("smb", "http"):
+        if stats[listener_kind + "_port"] is not None:
+            stats["listener_status"][listener_kind] = {
+                "state": "starting", "error": ""
+            }
 
     sink = Sink(args.outdir, hexu(challenge8).lower(), stats=stats)
 
@@ -1793,13 +1818,24 @@ def main():
     threads = []
     wire_monitor = None
     poisoner = None
+    server_by_kind = {}
+    attempt_lock = threading.Lock()
 
-    def start(server, label):
+    def start(server, label, kind):
         th = threading.Thread(target=server.serve_forever, daemon=True)
         th.start()
         servers.append(server)
         threads.append(th)
+        server_by_kind[kind] = server
+        stats["listener_status"][kind] = {"state": "up", "error": ""}
         print("  [+] %s" % label)
+
+    def listener_failed(kind, message):
+        stats["listener_status"][kind] = {
+            "state": "down", "error": message
+        }
+        print(Color.y("  [!] %s unavailable: %s" %
+                      (kind.upper(), message)))
 
     print(Color.b("ntlm_catch — NetNTLM capture listener"))
     print("  challenge   : %s  (fixed)" % hexu(challenge8))
@@ -1809,7 +1845,10 @@ def main():
     print("  loot dir    : %s/  (one file per capture + aggregate hash files, "
           "capture.log, session.log)" % args.outdir)
 
-    if args.mode in ("both", "smb"):
+    def attempt_smb():
+        nonlocal wire_monitor
+        if args.mode not in ("both", "smb") or "smb" in server_by_kind:
+            return False
         try:
             smb = LoudSMBServer((args.bind, args.smb_port), sink, challenge8,
                                 args.domain, args.computer, args.downgrade,
@@ -1818,15 +1857,20 @@ def main():
                 wire_monitor = SMBWireMonitor(args.smb_port,
                                               args.wire_interface)
                 wire_monitor.start()
-            start(smb, "SMB   listening on %s:%d" % (args.bind, args.smb_port))
+            start(smb, "SMB   listening on %s:%d" %
+                  (args.bind, args.smb_port), "smb")
+            return True
         except PermissionError:
-            print(Color.y("  [!] SMB %d needs root (try sudo, or --smb-port)"
-                          % args.smb_port))
+            listener_failed("smb", "port %d needs root/CAP_NET_BIND_SERVICE"
+                            % args.smb_port)
         except OSError as e:
-            print(Color.y("  [!] SMB bind failed on %d: %s"
-                          % (args.smb_port, e)))
+            listener_failed("smb", "bind %s:%d failed: %s" %
+                            (args.bind, args.smb_port, e))
+        return False
 
-    if args.mode in ("both", "http"):
+    def attempt_http():
+        if args.mode not in ("both", "http") or "http" in server_by_kind:
+            return False
         http = None
         try:
             handler = make_http_handler(sink, challenge8, args.domain,
@@ -1847,21 +1891,46 @@ def main():
                     http.socket, server_side=True, do_handshake_on_connect=False)
             scheme = "https" if use_tls else "http"
             start(http, "HTTP  listening on %s://%s:%d"
-                  % (scheme, args.bind, args.http_port))
+                  % (scheme, args.bind, args.http_port), "http")
+            return True
         except PermissionError:
-            print(Color.y("  [!] HTTP %d needs root (try sudo, or --http-port)"
-                          % args.http_port))
+            listener_failed("http", "port %d needs root/CAP_NET_BIND_SERVICE"
+                            % args.http_port)
         except OSError as e:
             if http is not None:
                 http.server_close()
-            print(Color.y("  [!] HTTP bind failed on %d: %s"
-                          % (args.http_port, e)))
+            listener_failed("http", "bind %s:%d failed: %s" %
+                            (args.bind, args.http_port, e))
         except Exception as e:
             if http is not None:
                 http.server_close()
-            print(Color.y("  [!] HTTP startup failed: %s" % e))
+            listener_failed("http", "startup failed: %s" % e)
+        return False
 
-    if servers and poisoning:
+    def retry_listeners():
+        if not attempt_lock.acquire(False):
+            return
+        try:
+            print(Color.d("[*] retrying unavailable listeners..."))
+            attempt_smb()
+            attempt_http()
+            down = [kind.upper() for kind, value in
+                    stats["listener_status"].items()
+                    if value.get("state") != "up"]
+            if down:
+                print(Color.y("[!] still unavailable: %s; press r to retry"
+                              % ", ".join(down)))
+            else:
+                print(Color.g("[+] all requested listeners are online"))
+        finally:
+            attempt_lock.release()
+
+    stats["retry_listeners"] = retry_listeners
+    with attempt_lock:
+        attempt_smb()
+        attempt_http()
+
+    if poisoning:
         try:
             poisoner = NamePoisoner(
                 args.poison_ip, args.poison_cidr, poison_protocols,
@@ -1874,16 +1943,8 @@ def main():
             print(Color.y("  [!] name poisoner startup failed: %s" % e))
 
     if not servers:
-        if split_view:
-            split_view.close()
-            sys.stdout = (_Tee(original_stdout, session_fh)
-                          if session_fh else original_stdout)
-        print(Color.y("[!] no listeners started — nothing to do."))
-        sys.stdout.flush()
-        sys.stdout = original_stdout
-        if session_fh:
-            session_fh.close()
-        return
+        print(Color.y("[!] no capture listeners are online; the process will "
+                      "stay running. Free the ports, then press r in the TUI."))
 
     if poisoner:
         print(Color.y("  poisoning scope: %s; TUI 1=LLMNR 2=NBT-NS 3=mDNS"

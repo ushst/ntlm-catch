@@ -94,6 +94,13 @@ the listener ignores its own address, responses are rate-limited, and
 keys `1`, `2`, and `3` toggle LLMNR, NBT-NS, and mDNS at runtime. Lowercase
 letters in `P:LNM` indicate a disabled protocol. `A:LNM` denotes analyze mode.
 
+If SMB or HTTP cannot bind because a port is occupied or privileges are
+missing, the process and TUI stay online. The header shows `SMB:445/DOWN` or
+`HTTP:80/DOWN`, and the event pane preserves the exact bind error. Free the
+port or fix capabilities, then press `r` to retry unavailable listeners without
+restarting the process. Poison analyze/response mode can continue while a
+capture transport is down.
+
 ### Why a domain controller may authenticate without explicit coercion
 
 A DC or another server can initiate outbound SMB/HTTP authentication during
